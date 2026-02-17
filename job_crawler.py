@@ -879,6 +879,16 @@ class JobCrawler:
                 continue
 
             title = self._pick_text(node, ["title", "position", "positionTitle", "jobTitle", "name"])
+            annual_from_text = self._pick_text(node, ["annual_from", "annualFrom"])
+            annual_to_text = self._pick_text(node, ["annual_to", "annualTo"])
+            employment_type = self._pick_text(node, ["employment_type", "employmentType"])
+            experience_hint = self._wanted_experience_hint(
+                annual_from_text=annual_from_text,
+                annual_to_text=annual_to_text,
+                employment_type=employment_type,
+            )
+            if title and experience_hint and experience_hint not in title:
+                title = f"{title} [{experience_hint}]"
             company = self._pick_text(node, ["companyName", "company", "company_name", "name"])
             location = self._pick_text(node, ["location", "address", "region", "country"])
             deadline = self._pick_text(node, ["dueTime", "deadline", "closeDate", "endDate"])
@@ -912,6 +922,52 @@ class JobCrawler:
             )
 
         return postings
+
+    def _wanted_experience_hint(self, annual_from_text: str, annual_to_text: str, employment_type: str) -> str:
+        from_year = self._parse_int(annual_from_text)
+        to_year = self._parse_int(annual_to_text)
+
+        hint_parts: list[str] = []
+
+        if from_year is not None and to_year is not None:
+            if from_year <= 0 and to_year <= 0:
+                hint_parts.append("신입 가능")
+            elif from_year <= 0:
+                hint_parts.append(f"신입 가능 (0~{to_year}년)")
+            elif to_year < from_year or to_year >= 100:
+                hint_parts.append(f"경력 {from_year}년+")
+            elif from_year == to_year:
+                hint_parts.append(f"경력 {from_year}년")
+            else:
+                hint_parts.append(f"경력 {from_year}~{to_year}년")
+        elif from_year is not None:
+            if from_year <= 0:
+                hint_parts.append("신입 가능")
+            else:
+                hint_parts.append(f"경력 {from_year}년+")
+        elif to_year is not None:
+            if to_year <= 0:
+                hint_parts.append("신입 가능")
+            else:
+                hint_parts.append(f"경력 ~{to_year}년")
+
+        emp_token = employment_type.strip().lower().replace("-", "_").replace(" ", "_")
+        emp_map = {
+            "regular": "정규직",
+            "contract": "계약직",
+            "temporary": "계약직",
+            "intern": "인턴",
+            "freelancer": "프리랜서",
+            "part_time": "파트타임",
+            "full_time": "정규직",
+        }
+        emp_label = emp_map.get(emp_token, "")
+        if not emp_label and employment_type and not re.fullmatch(r"[a-zA-Z_]+", employment_type.strip()):
+            emp_label = self._clean_text(employment_type)
+        if emp_label and emp_label not in hint_parts:
+            hint_parts.append(emp_label)
+
+        return " / ".join(hint_parts)
 
     def _extract_from_jasoseol_api_payload(
         self,
@@ -1094,6 +1150,19 @@ class JobCrawler:
                 if nested:
                     return nested
         return ""
+
+    @staticmethod
+    def _parse_int(value: str) -> int | None:
+        token = (value or "").strip()
+        if not token:
+            return None
+        match = re.search(r"-?\d+", token)
+        if not match:
+            return None
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return None
 
     @staticmethod
     def _dict_get_case_insensitive(node: dict, key: str):
