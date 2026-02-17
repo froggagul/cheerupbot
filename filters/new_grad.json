@@ -1,0 +1,16 @@
+{
+  "all": [
+    {
+      "field": "_text",
+      "op": "regex",
+      "value": "신입|인턴|entry|junior|계약|계약직"
+    },
+    {
+      "not": {
+        "field": "_text",
+        "op": "regex",
+        "value": "경력\\s*\\d+|\\d+\\s*년\\s*이상|senior|lead|manager|팀장|인재\\s*풀|인재\\s*pool|talent\\s*pool|pool\\s*등록|인재풀\\s*(등록|등륵)|총무"
+      }
+    }
+  ]
+}
