@@ -206,6 +206,24 @@ JOB_INPUT_JSON=jobs_debug.json JOB_EMAIL_DRY_RUN=1 ./scripts/run_daily_email.sh
 - `JOB_ENV_FILE` (기본 `.env`)
 - `JOB_MESSAGE_MAX_ITEMS` (기본 `0`, 전체 출력)
 
+### 가장 간단한 배포(우분투 1대)
+서버에서 레포를 클론한 뒤 아래 한 줄로 세팅합니다.
+
+```bash
+bash scripts/bootstrap_ubuntu.sh --cron "0 9 * * *"
+```
+
+옵션:
+- `--with-playwright` : JS 렌더링 크롤링까지 사용할 때
+- `--env-file .env` : 다른 env 파일명 사용
+- `--dry-run` : 설치 명령 미실행 검증
+
+설치 후 확인:
+1. `.env`에 `SMTP_*` 값 입력
+2. `recipients.txt` 수신자 입력
+3. 테스트: `JOB_EMAIL_DRY_RUN=1 bash scripts/run_daily_email.sh`
+4. 크론 확인: `crontab -l`
+
 ### 카카오톡 친구 전송(테스트 앱 멤버 범위)
 `kakao_sender.py`는 `jobs_message.txt` 같은 텍스트 파일을 카카오톡으로 전송합니다.
 
