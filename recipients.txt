@@ -1,0 +1,6 @@
+# 한 줄에 이메일 주소 하나씩 작성하세요.
+# 예:
+# me@example.com
+# froggagul.private@gmail.com
+ohansae@naver.com
+froggagul2@naver.com
