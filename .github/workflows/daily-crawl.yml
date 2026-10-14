@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
+      TZ: Asia/Seoul
       JOB_ENV_FILE: /dev/null
       JOB_STATE_FILE: .crawl-state/state.sql
       JOB_AGENT_FILTER_PROVIDER: openai
@@ -63,18 +64,31 @@ jobs:
       - name: Restore SQL snapshot
         id: restore
         run: .venv/bin/python scripts/sync_crawl_state.py restore
-      - name: Crawl, filter, and email
+      - name: Crawl, filter, and prepare email
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Delivery happens only after the repository snapshot is safely pushed.
+          JOB_EMAIL_DRY_RUN: '1'
+        run: bash scripts/run_daily_email.sh
+      - name: Commit SQL snapshot
+        if: ${{ always() && steps.restore.outcome == 'success' }}
+        run: .venv/bin/python scripts/sync_crawl_state.py save
+      - name: Send email via SMTP
+        if: ${{ success() && env.JOB_EMAIL_DRY_RUN != '1' }}
+        env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
-        run: bash scripts/run_daily_email.sh
-      - name: Commit SQL snapshot
-        if: ${{ always() && steps.restore.outcome == 'success' }}
-        run: .venv/bin/python scripts/sync_crawl_state.py save
+        run: |
+          .venv/bin/python email_sender.py \
+            --message-file out/jobs_message_latest.txt \
+            --html-file out/jobs_message_latest.html \
+            --subject '[알림] 오늘의 채용 요약' \
+            --recipients-file recipients.txt \
+            --send-mode single \
+            --no-dotenv
       - name: Save reports and email preview
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
