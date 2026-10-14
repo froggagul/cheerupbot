@@ -351,7 +351,7 @@ python email_sender.py \
 5. SQL을 내보내고 내용이 바뀌었을 때만 `crawl-state`에 커밋/푸시합니다.
 6. 앞 단계가 모두 성공한 경우에만 준비한 이메일을 SMTP로 발송합니다. Dry run은 이 단계를 건너뜁니다.
 
-기본 수신자는 현재 **`froggaguldev@gmail.com`** 하나입니다. 변경은 `recipients.txt`에서 합니다.
+기본 수신자는 현재 **`froggaguldev@gmail.com`**, **`ohansae@naver.com`** 두 명입니다. 변경은 `recipients.txt`에서 합니다.
 이메일은 기존과 같이 **오늘 수집하여 필터를 통과한 전체 공고**를 포함합니다.
 저장된 과거 공고를 이메일에 다시 합치거나, 이미 보냈다는 이유로 공고를 제외하지 않습니다.
 재실행하면 이메일이 다시 발송될 수 있습니다. 발송 없이 검증하려면 dry run을 사용하세요.

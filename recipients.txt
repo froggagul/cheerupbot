@@ -1,2 +1,3 @@
-# Temporary recipient for the daily job digest.
+# Recipients for the daily job digest.
 froggaguldev@gmail.com
+ohansae@naver.com
