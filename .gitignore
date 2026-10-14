@@ -14,3 +14,6 @@ dump
 .env.*
 !.env.example
 out
+.crawl-state/
+*.sqlite3
+logs/

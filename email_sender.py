@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-dotenv", action="store_true", help="Disable .env loading")
     parser.add_argument("--message-file", default="jobs_message.txt", help="Message text file path")
     parser.add_argument("--message-text", default="", help="Inline message text (overrides --message-file)")
+    parser.add_argument("--html-file", default="", help="Formatted HTML email paired with the plain-text message")
+    parser.add_argument("--preview-html", default="", help="Save the HTML preview and exit without sending (no SMTP required)")
     parser.add_argument("--subject", default="[알림] 오늘의 채용 요약", help="Email subject")
     parser.add_argument(
         "--recipients-file",
@@ -95,7 +97,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Do not send; print summary only")
     parser.add_argument("--debug", action="store_true", help="Print debug logs")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.preview_html and any(
+        path and Path(args.preview_html).resolve() == Path(path).resolve()
+        for path in (args.message_file, args.html_file)
+    ):
+        parser.error("--preview-html must use a different path from the input files")
+    return args
 
 
 def _log(msg: str, debug: bool) -> None:
@@ -151,6 +159,18 @@ def _load_recipients(recipients_file: str, cli_recipients: list[str]) -> list[st
     return deduped
 
 
+def _load_html_body(html_file: str, body: str) -> str:
+    if not html_file:
+        return _render_html_body(body)
+    try:
+        content = Path(html_file).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise EmailSendError(f"Failed to read HTML file '{html_file}': {exc}") from exc
+    if not content:
+        raise EmailSendError(f"HTML email is empty: {html_file}")
+    return content
+
+
 def _validate_sender(from_email: str, smtp_user: str) -> str:
     sender = from_email.strip() or smtp_user.strip()
     if not sender:
@@ -166,6 +186,7 @@ def _build_message(
     body: str,
     reply_to: str,
     use_bcc: bool,
+    html_body: str | None = None,
 ) -> EmailMessage:
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -178,7 +199,7 @@ def _build_message(
     if reply_to.strip():
         msg["Reply-To"] = reply_to.strip()
     msg.set_content(body, subtype="plain", charset="utf-8")
-    msg.add_alternative(_render_html_body(body), subtype="html", charset="utf-8")
+    msg.add_alternative(html_body if html_body is not None else _render_html_body(body), subtype="html", charset="utf-8")
     return msg
 
 
@@ -195,7 +216,7 @@ def _render_html_body(body: str) -> str:
         escaped_href = html.escape(link_url, quote=True)
         escaped_label = html.escape(link_url)
         chunks.append(
-            f'<a href="{escaped_href}" target="_blank" rel="noopener noreferrer">{escaped_label}</a>'
+            f'<a href="{escaped_href}" target="_blank" rel="noopener noreferrer" style="color:#0f766e;word-break:break-all;">{escaped_label}</a>'
         )
         if trailing:
             chunks.append(html.escape(trailing))
@@ -204,8 +225,12 @@ def _render_html_body(body: str) -> str:
     chunks.append(html.escape(body[cursor:]))
     linked = "".join(chunks).replace("\n", "<br>\n")
     return (
-        "<html><body>"
-        "<div style='white-space: pre-wrap; font-family: Arial, sans-serif; font-size: 14px; line-height: 1.5;'>"
+        '<!doctype html><html lang="ko"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"></head>'
+        '<body style="margin:0;padding:20px 12px;background:#f1f5f9;">'
+        '<div style="max-width:640px;margin:0 auto;padding:24px;background:#ffffff;border:1px solid #e2e8f0;'
+        'border-radius:12px;font-family:Arial,\'Malgun Gothic\',sans-serif;font-size:16px;line-height:1.8;'
+        'color:#0f172a;overflow-wrap:anywhere;">'
         f"{linked}"
         "</div></body></html>"
     )
@@ -251,6 +276,14 @@ def main() -> None:
     args = parse_args()
     try:
         body = _load_message(args.message_file, args.message_text)
+        html_body = _load_html_body(args.html_file, body)
+        if args.preview_html:
+            try:
+                Path(args.preview_html).write_text(html_body, encoding="utf-8")
+            except OSError as exc:
+                raise EmailSendError(f"Failed to write HTML preview: {args.preview_html}") from exc
+            print(f"Saved HTML preview to {args.preview_html}; no email sent.")
+            return
         recipients = _load_recipients(args.recipients_file, args.to)
         sender = (args.from_email.strip() or args.smtp_user.strip() or "(unset)")
         if not args.dry_run:
@@ -274,6 +307,7 @@ def main() -> None:
                     sender=sender,
                     recipients=recipients,
                     body=body,
+                    html_body=html_body,
                     reply_to=args.reply_to,
                     use_bcc=True,
                 )
@@ -287,6 +321,7 @@ def main() -> None:
                         sender=sender,
                         recipients=[recipient],
                         body=body,
+                        html_body=html_body,
                         reply_to=args.reply_to,
                         use_bcc=False,
                     )

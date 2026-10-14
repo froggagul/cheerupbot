@@ -4,14 +4,16 @@ import json
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 DEFAULT_SITES = [
     "saramin",
@@ -100,9 +102,31 @@ class JobPosting:
     link: str
     source_url: str
     collected_at: str
+    description: str = ""
+    experience: str = ""
+    employment_type: str = ""
+    matched_keywords: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+class CrawlError(RuntimeError):
+    """No requested site/keyword search could be read successfully."""
+
+
+@dataclass
+class CrawlOutcome:
+    site: str
+    keyword: str
+    status: str = "failed"
+    count: int = 0
+    pages: int = 0
+    page_requests: int = 0
+    requests: int = 0
+    detail_requests: int = 0
+    stop_reason: str = "exhausted"
+    errors: list[str] = field(default_factory=list)
 
 
 class JobCrawler:
@@ -112,12 +136,33 @@ class JobCrawler:
         debug: bool = False,
         render_js: bool = False,
         dump_dir: str | None = None,
+        max_pages: int = 3,
+        max_requests: int = 20,
+        max_detail_requests: int = 10,
+        retries: int = 2,
+        request_interval: float = 0.25,
     ) -> None:
+        if timeout <= 0 or max_pages < 1 or max_requests < 1 or max_detail_requests < 0 or retries < 0:
+            raise ValueError("Timeout/page/request budgets must be positive; detail/retry budgets may be zero")
+        if not 0 <= request_interval <= 10:
+            raise ValueError("request_interval must be between 0 and 10 seconds")
         self.timeout = timeout
         self.debug = debug
         self.render_js = render_js
         self.dump_dir = Path(dump_dir) if dump_dir else None
         self.session = requests.Session()
+        retry = Retry(total=retries, backoff_factor=0.5, allowed_methods={"GET"},
+                      status_forcelist=(429, 500, 502, 503, 504), respect_retry_after_header=True)
+        for scheme in ("https://", "http://"):
+            self.session.mount(scheme, HTTPAdapter(max_retries=retry))
+        self.max_pages = max_pages
+        self.max_requests = max_requests
+        self.max_detail_requests = max_detail_requests
+        self.request_interval = request_interval
+        self.outcomes: list[CrawlOutcome] = []
+        self._active: CrawlOutcome | None = None
+        self._request_times: dict[str, float] = {}
+        self._detail_cache: dict[str, dict[str, str]] = {}
         self.js_sites = {"wanted", "linkareer", "jasoseol", "catch"}
         self._playwright = None
         self._browser = None
@@ -139,139 +184,243 @@ class JobCrawler:
         )
 
     def crawl(self, sites: Iterable[str], keywords: Iterable[str], limit_per_site: int = 20) -> list[JobPosting]:
+        sites = list(dict.fromkeys(sites))
+        keywords = list(dict.fromkeys(k.strip() for k in keywords if k.strip()))
+        if limit_per_site < 1 or not sites or not keywords:
+            raise ValueError("A positive candidate limit, at least one site, and a keyword are required")
+        unknown = set(sites) - SITE_CONFIGS.keys()
+        if unknown:
+            raise ValueError(f"Unknown site ids: {', '.join(sorted(unknown))}")
+        self.outcomes = []
+        self._detail_cache.clear()
         collected: list[JobPosting] = []
-
         for site in sites:
-            if site not in SITE_CONFIGS:
-                self._log(f"[skip] Unknown site id: {site}")
-                continue
             for keyword in keywords:
-                site_keyword_items = self._crawl_site_keyword(site, keyword, limit_per_site)
-                collected.extend(site_keyword_items)
-                self._log(f"[result] site={site} keyword={keyword} count={len(site_keyword_items)}")
-
+                outcome = CrawlOutcome(site, keyword)
+                self.outcomes.append(outcome)
+                self._active = outcome
+                try:
+                    items = self._crawl_site_keyword(site, keyword, limit_per_site)
+                    if not outcome.pages and not items and not outcome.errors:
+                        self._error(f"site={site} keyword={keyword} no search page could be validated")
+                finally:
+                    self._active = None
+                outcome.count = len(items)
+                if outcome.errors:
+                    outcome.status = "partial" if outcome.pages else "failed"
+                else:
+                    outcome.status = "success" if items else "empty"
+                collected.extend(items)
+                self._log(f"[result] site={site} keyword={keyword} status={outcome.status} "
+                          f"count={len(items)} pages={outcome.pages} requests={outcome.requests} "
+                          f"stop={outcome.stop_reason}")
+        if all(o.status == "failed" for o in self.outcomes):
+            raise CrawlError("All searches failed; see crawl diagnostics or --crawl-report")
         return self._deduplicate(collected)
+
+    def _error(self, message: str) -> None:
+        if self._active is not None:
+            self._active.errors.append(message)
+        self._log(f"[error] {message}")
+
+    def _reserve_request(self, url: str, detail: bool = False) -> bool:
+        if self._active is not None:
+            if self._active.requests >= self.max_requests:
+                self._active.stop_reason = "request_budget"
+                return False
+            if not detail and self._active.page_requests >= self.max_pages:
+                self._active.stop_reason = "page_budget"
+                return False
+            if detail and self._active.detail_requests >= self.max_detail_requests:
+                return False
+            self._active.requests += 1
+            self._active.detail_requests += int(detail)
+            self._active.page_requests += int(not detail)
+        host = urlparse(url).netloc
+        delay = self.request_interval - (time.monotonic() - self._request_times.get(host, 0))
+        if delay > 0:
+            time.sleep(delay)
+        self._request_times[host] = time.monotonic()
+        return True
+
+    def _get(self, site: str, keyword: str, url: str, *, detail: bool = False, **kwargs) -> requests.Response | None:
+        if not self._reserve_request(url, detail):
+            return None
+        try:
+            response = self.session.get(url, timeout=self.timeout, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            self._error(f"site={site} keyword={keyword} request failed url={url} "
+                        f"reason={type(exc).__name__}: {exc}")
+            return None
+
+    def _page_succeeded(self) -> None:
+        if self._active is not None:
+            self._active.pages += 1
 
     def _crawl_site_keyword(self, site: str, keyword: str, limit_per_site: int) -> list[JobPosting]:
         cfg = SITE_CONFIGS[site]
-        if site == "jasoseol":
-            api_results = self._crawl_jasoseol_api(keyword=keyword, limit_per_site=limit_per_site, cfg=cfg)
-            if api_results:
-                return api_results
-        if site == "wanted":
-            api_results = self._crawl_wanted_api(keyword=keyword, limit_per_site=limit_per_site, cfg=cfg)
-            if api_results:
-                return api_results
-        if site == "catch":
-            api_results = self._crawl_catch_api(keyword=keyword, limit_per_site=limit_per_site, cfg=cfg)
-            if api_results:
-                return api_results
-
-        encoded_keyword = quote_plus(keyword)
-        query_urls = cfg.get("search_urls", [cfg.get("search_url", "")])
-        query_urls = [u.format(query=encoded_keyword) for u in query_urls if u]
-
+        api_crawlers = {"jasoseol": self._crawl_jasoseol_api, "wanted": self._crawl_wanted_api,
+                        "catch": self._crawl_catch_api}
         collected: list[JobPosting] = []
-        for search_url in query_urls:
-            fetched = self._fetch_html(site=site, keyword=keyword, search_url=search_url)
+        if site in api_crawlers:
+            collected = api_crawlers[site](keyword, limit_per_site, cfg)
+            # A validated empty API response is a real empty result, not a transport failure.
+            if collected or (self._active is not None and self._active.pages):
+                return self._finish_candidates(site, collected, limit_per_site)
+
+        urls = [u.format(query=quote_plus(keyword))
+                for u in cfg.get("search_urls", [cfg.get("search_url", "")]) if u]
+        visited: set[str] = set()
+        fingerprints: set[tuple[str, ...]] = set()
+        for _ in range(self.max_pages):
+            if not urls:
+                break
+            search_url = urls.pop(0)
+            if search_url in visited:
+                break
+            visited.add(search_url)
+            fetched = self._fetch_html(site, keyword, search_url)
             if not fetched:
                 continue
             html, final_url = fetched
-
             soup = BeautifulSoup(html, "lxml")
-            now = datetime.now(timezone.utc).isoformat()
-
-            if site == "jasoseol":
-                postings = self._extract_jasoseol_results(
-                    soup=soup,
-                    site=site,
-                    keyword=keyword,
-                    base_url=cfg["base_url"],
-                    source_url=final_url,
-                    collected_at=now,
-                )
-                self._log(f"[parse] site={site} keyword={keyword} jasoseol_extract_count={len(postings)}")
-                collected.extend(postings)
-                if len(collected) >= limit_per_site:
-                    break
+            postings = self._extract_html(soup, site, keyword, final_url)
+            links = tuple(sorted({self._canonical_job_url(site, urljoin(cfg["base_url"], a["href"]))
+                                  for a in soup.select("a[href]")
+                                  if self._canonical_job_url(site, urljoin(cfg["base_url"], a["href"]))}))
+            empty = bool(re.search(r"검색\s*결과[\s\S]{0,40}(?:없|0\s*건)|검색된[\s\S]{0,30}없|no results",
+                                   soup.get_text(" ", strip=True), re.IGNORECASE))
+            if not postings and not links and not empty:
+                self._error(f"site={site} keyword={keyword} unrecognized search HTML url={final_url}")
                 continue
-
-            postings = self._extract_by_config(soup, site, keyword, cfg, final_url, now)
-            self._log(f"[parse] site={site} keyword={keyword} css_extract_count={len(postings)}")
-
-            if not postings and site == "jobkorea":
-                postings = self._extract_jobkorea_cards(soup, site, keyword, final_url, now)
-                self._log(f"[fallback] site={site} keyword={keyword} jobkorea_extract_count={len(postings)}")
-            if not postings:
-                postings = self._extract_from_anchors(soup, site, keyword, cfg["base_url"], final_url, now)
-                self._log(f"[fallback] site={site} keyword={keyword} anchor_extract_count={len(postings)}")
-            if not postings:
-                postings = self._extract_from_json_ld(soup, site, keyword, cfg["base_url"], final_url, now)
-                self._log(f"[fallback] site={site} keyword={keyword} jsonld_extract_count={len(postings)}")
-            if not postings:
-                postings = self._extract_from_inline_json(soup, site, keyword, cfg["base_url"], final_url, now)
-                self._log(f"[fallback] site={site} keyword={keyword} json_extract_count={len(postings)}")
-
-            collected.extend(postings)
-            if len(collected) >= limit_per_site:
+            self._page_succeeded()
+            fingerprint = links or tuple(sorted(p.link for p in postings))
+            if fingerprint and fingerprint in fingerprints:
+                if self._active:
+                    self._active.stop_reason = "repeated_page"
                 break
+            fingerprints.add(fingerprint)
+            collected = self._deduplicate(collected + postings)
+            if len(collected) >= limit_per_site:
+                if self._active:
+                    self._active.stop_reason = "candidate_limit"
+                break
+            next_url = self._next_html_page(soup, site, final_url)
+            if next_url:
+                urls.insert(0, next_url)
+            elif postings or links or empty:
+                break
+        else:
+            if urls and self._active and self._active.stop_reason != "request_budget":
+                self._active.stop_reason = "page_budget"
+        return self._finish_candidates(site, collected, limit_per_site)
 
+    def _finish_candidates(self, site: str, items: list[JobPosting], limit: int) -> list[JobPosting]:
+        items = self._deduplicate(items)[:limit]
         if site == "wanted":
-            collected = [self._enrich_wanted_posting(item) for item in collected]
-        return collected[:limit_per_site]
+            items = [self._enrich_wanted_posting(item) for item in items]
+        return items
+
+    def _extract_html(self, soup: BeautifulSoup, site: str, keyword: str, source_url: str) -> list[JobPosting]:
+        cfg = SITE_CONFIGS[site]
+        now = datetime.now(timezone.utc).isoformat()
+        args = (soup, site, keyword, cfg["base_url"], source_url, now)
+        postings = self._extract_from_json_ld(*args)
+        postings.extend(self._extract_from_inline_json(*args))
+        if site == "jobkorea":
+            postings.extend(self._extract_jobkorea_cards(soup, site, keyword, source_url, now))
+        if site == "jasoseol":
+            postings.extend(self._extract_jasoseol_results(*args))
+        postings.extend(self._extract_by_config(soup, site, keyword, cfg, source_url, now))
+        postings.extend(self._extract_from_anchors(*args))
+        return self._deduplicate(postings)
+
+    def _next_html_page(self, soup: BeautifulSoup, site: str, source_url: str) -> str | None:
+        params = dict(parse_qsl(urlparse(source_url).query))
+        page_key = {"jobkorea": "Page_No", "linkareer": "page", "saramin": "recruitPage"}.get(site)
+        if not page_key:
+            return None
+        current = self._parse_int(params.get(page_key, "1")) or 1
+        for anchor in soup.select("a[href]"):
+            target = urljoin(source_url, anchor["href"])
+            parsed = urlparse(target)
+            target_params = dict(parse_qsl(parsed.query))
+            if (parsed.scheme in {"http", "https"} and parsed.netloc == urlparse(source_url).netloc
+                    and parsed.path.rstrip("/") == urlparse(source_url).path.rstrip("/")
+                    and target_params.get(page_key) == str(current + 1)):
+                return target
+        # Saramin uses fragment links with a page attribute instead of page URLs.
+        if site == "saramin" and soup.select_one(f'a.page_move[page="{current + 1}"], a[data-page="{current + 1}"]'):
+            params[page_key] = str(current + 1)
+            return urlunparse(urlparse(source_url)._replace(query=urlencode(params), fragment=""))
+        return None
+
+    def _api_pages(self, site: str, keyword: str, cfg: dict, params: dict,
+                   limit: int, list_key: str | None,
+                   extractor: Callable[[object, str, str, str], list[JobPosting]]) -> list[JobPosting]:
+        collected: list[JobPosting] = []
+        seen: set[tuple[str, ...]] = set()
+        offset = 0
+        for page in range(1, self.max_pages + 1):
+            if site == "wanted":
+                params["offset"] = str(offset)
+            elif site == "catch":
+                params["curpage"] = str(page)
+            response = self._get(site, keyword, cfg["api_url"], params=dict(params), headers={
+                "Accept": "application/json", "Referer": cfg["base_url"] + "/",
+            })
+            if response is None:
+                break
+            self._dump_response(site, keyword, response.url, response.text, "json", "api")
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                self._error(f"site={site} keyword={keyword} invalid JSON: {exc}")
+                break
+            rows = (payload.get(list_key) if isinstance(payload, dict) else None) if list_key else payload
+            if not isinstance(rows, list):
+                self._error(f"site={site} keyword={keyword} unexpected API schema")
+                break
+            # Validate records independently of keyword filtering so schema drift is visible.
+            unfiltered = extractor(payload, "", response.url, cfg["base_url"])
+            if rows and not unfiltered:
+                self._error(f"site={site} keyword={keyword} API records have no valid job identities")
+                break
+            self._page_succeeded()
+            if not rows:
+                break
+            fingerprint = tuple(sorted({item.link for item in unfiltered}))
+            if fingerprint in seen:
+                if self._active:
+                    self._active.stop_reason = "repeated_page"
+                break
+            seen.add(fingerprint)
+            collected = self._deduplicate(collected + extractor(payload, keyword, response.url, cfg["base_url"]))
+            if len(collected) >= limit:
+                if self._active:
+                    self._active.stop_reason = "candidate_limit"
+                break
+            offset += len(rows)
+            if site == "jasoseol":
+                break  # This endpoint returns all matching companies in one response.
+            total_key = "total_count" if site == "wanted" else "intTotalRecordCount"
+            total = self._parse_int(str(payload.get(total_key, "")))
+            if total is not None and offset >= total:
+                break
+            if site == "wanted" and isinstance(payload.get("links"), dict):
+                if "next" in payload["links"] and not payload["links"]["next"]:
+                    break
+            if page == self.max_pages and self._active:
+                self._active.stop_reason = "page_budget"
+        return collected[:limit]
 
     def _crawl_jasoseol_api(self, keyword: str, limit_per_site: int, cfg: dict) -> list[JobPosting]:
-        api_url = cfg.get("api_url")
-        if not api_url:
-            return []
-
-        after_end_time = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-        params = {
-            "field_query": keyword,
-            "all": "true",
-            "after_end_time": after_end_time,
-        }
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://jasoseol.com/",
-        }
-        try:
-            response = self.session.get(api_url, params=params, headers=headers, timeout=self.timeout)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
-            self._log(
-                f"[error] site=jasoseol keyword={keyword} jasoseol-api failed url={api_url} "
-                f"reason={type(exc).__name__}: {exc}"
-            )
-            return []
-        except json.JSONDecodeError as exc:
-            self._log(
-                f"[error] site=jasoseol keyword={keyword} jasoseol-api json decode failed "
-                f"reason={type(exc).__name__}: {exc}"
-            )
-            return []
-
-        self._log(
-            f"[fetch-api] site=jasoseol keyword={keyword} status={response.status_code} "
-            f"bytes={len(response.text)} url={response.url}"
-        )
-        self._dump_response(
-            site="jasoseol",
-            keyword=keyword,
-            url=response.url,
-            content=response.text,
-            ext="json",
-            stage="api",
-        )
-        postings = self._extract_from_jasoseol_api_payload(
-            payload=payload,
-            keyword=keyword,
-            source_url=response.url,
-            base_url=cfg["base_url"],
-        )
-        self._log(f"[parse-api] site=jasoseol keyword={keyword} count={len(postings)}")
-        return postings[:limit_per_site]
+        return self._api_pages("jasoseol", keyword, cfg, {
+            "field_query": keyword, "all": "true",
+            "after_end_time": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT"),
+        }, limit_per_site, None, self._extract_from_jasoseol_api_payload)
 
     def _extract_jasoseol_results(
         self,
@@ -297,8 +446,8 @@ class JobCrawler:
 
         for anchor in anchors:
             href_raw = anchor.get("href", "")
-            href = self._normalize_url(urljoin(base_url, href_raw))
-            if "/recruit/" not in href:
+            href = self._canonical_job_url(site, urljoin(base_url, href_raw))
+            if not href:
                 continue
             if href in seen_links:
                 continue
@@ -327,181 +476,56 @@ class JobCrawler:
         return postings
 
     def _crawl_wanted_api(self, keyword: str, limit_per_site: int, cfg: dict) -> list[JobPosting]:
-        api_url = cfg.get("api_url")
-        if not api_url:
-            return []
-
-        ts = str(int(time.time() * 1000))
-        params = {
-            "query": keyword,
-            "country": "kr",
-            "years": "-1",
-            "locations": "all",
-            "sort": "job.recommend_order",
-            "limit": str(max(20, limit_per_site)),
-            "offset": "0",
-            ts: "",
-        }
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://www.wanted.co.kr/",
-        }
-
-        try:
-            response = self.session.get(api_url, params=params, headers=headers, timeout=self.timeout)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
-            self._log(
-                f"[error] site=wanted keyword={keyword} wanted-api failed url={api_url} "
-                f"reason={type(exc).__name__}: {exc}"
-            )
-            return []
-        except json.JSONDecodeError as exc:
-            self._log(
-                f"[error] site=wanted keyword={keyword} wanted-api json decode failed "
-                f"reason={type(exc).__name__}: {exc}"
-            )
-            return []
-
-        self._log(
-            f"[fetch-api] site=wanted keyword={keyword} status={response.status_code} "
-            f"bytes={len(response.text)} url={response.url}"
-        )
-        self._dump_response(
-            site="wanted",
-            keyword=keyword,
-            url=response.url,
-            content=response.text,
-            ext="json",
-            stage="api",
-        )
-        postings = self._extract_from_wanted_api_payload(
-            payload=payload,
-            keyword=keyword,
-            source_url=response.url,
-            base_url=cfg["base_url"],
-        )
-        self._log(f"[parse-api] site=wanted keyword={keyword} count={len(postings)}")
-        return postings[:limit_per_site]
+        return self._api_pages("wanted", keyword, cfg, {
+            "query": keyword, "country": "kr", "years": "-1", "locations": "all",
+            "sort": "job.recommend_order", "limit": "20",
+        }, limit_per_site, "data", self._extract_from_wanted_api_payload)
 
     def _crawl_catch_api(self, keyword: str, limit_per_site: int, cfg: dict) -> list[JobPosting]:
-        api_url = cfg.get("api_url")
-        if not api_url:
-            return []
-
-        params = {
-            "Keyword": keyword,
-            "JobCode": "",
-            "Sido": "",
-            "Career": "",
-            "JCode": "",
-            "Size": "",
-            "EduLevel": "",
-            "WorkPosition": "",
-            "CompID": "",
-            "GroupCode": "",
-            "Sort": "0",
-            "curpage": "1",
-            "pageSize": str(max(30, limit_per_site)),
-            "onRecruitYN": "Y",
-            "ExceptIDList": "",
-        }
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://www.catch.co.kr/NCS/RecruitSearch",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        try:
-            response = self.session.get(api_url, params=params, headers=headers, timeout=self.timeout)
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
-            self._log(
-                f"[error] site=catch keyword={keyword} catch-api failed url={api_url} "
-                f"reason={type(exc).__name__}: {exc}"
-            )
-            return []
-        except json.JSONDecodeError as exc:
-            self._log(
-                f"[error] site=catch keyword={keyword} catch-api json decode failed "
-                f"reason={type(exc).__name__}: {exc}"
-            )
-            return []
-
-        self._log(
-            f"[fetch-api] site=catch keyword={keyword} status={response.status_code} "
-            f"bytes={len(response.text)} url={response.url}"
-        )
-        self._dump_response(
-            site="catch",
-            keyword=keyword,
-            url=response.url,
-            content=response.text,
-            ext="json",
-            stage="api",
-        )
-        postings = self._extract_from_catch_api_payload(
-            payload=payload,
-            keyword=keyword,
-            source_url=response.url,
-            base_url=cfg["base_url"],
-        )
-        self._log(f"[parse-api] site=catch keyword={keyword} count={len(postings)}")
-        return postings[:limit_per_site]
+        return self._api_pages("catch", keyword, cfg, {
+            "Keyword": keyword, "JobCode": "", "Sido": "", "Career": "", "JCode": "",
+            "Size": "", "EduLevel": "", "WorkPosition": "", "CompID": "", "GroupCode": "",
+            "Sort": "0", "pageSize": "30", "onRecruitYN": "Y", "ExceptIDList": "",
+        }, limit_per_site, "recruitData", self._extract_from_catch_api_payload)
 
     def _fetch_html(self, site: str, keyword: str, search_url: str) -> tuple[str, str] | None:
         if self.render_js and site in self.js_sites:
             rendered = self._fetch_html_with_playwright(site, keyword, search_url)
             if rendered:
                 return rendered
-
-        try:
-            response = self.session.get(search_url, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            self._log(
-                f"[error] site={site} keyword={keyword} request failed url={search_url} "
-                f"reason={type(exc).__name__}: {exc}"
-            )
+        response = self._get(site, keyword, search_url)
+        if response is None:
             return None
-
-        self._log(
-            f"[fetch] site={site} keyword={keyword} status={response.status_code} "
-            f"bytes={len(response.text)} url={response.url}"
-        )
-        self._dump_response(
-            site=site,
-            keyword=keyword,
-            url=response.url,
-            content=response.text,
-            ext="html",
-            stage="http",
-        )
+        self._log(f"[fetch] site={site} keyword={keyword} status={response.status_code} "
+                  f"bytes={len(response.text)} url={response.url}")
+        self._dump_response(site, keyword, response.url, response.text, "html", "http")
         return response.text, response.url
 
     def _fetch_html_with_playwright(self, site: str, keyword: str, search_url: str) -> tuple[str, str] | None:
+        if not self._reserve_request(search_url):
+            return None
         try:
             context, page = self._new_page()
         except Exception as exc:
-            self._log(
-                f"[error] site={site} keyword={keyword} playwright init failed "
+            self._error(
+                f"site={site} keyword={keyword} playwright init failed "
                 f"reason={type(exc).__name__}: {exc}"
             )
             return None
 
         try:
             response = page.goto(search_url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
-            page.wait_for_timeout(1200)
-            html = page.content()
             status = response.status if response else "n/a"
-            final_url = page.url
             if isinstance(status, int) and status >= 400:
-                self._log(
-                    f"[error] site={site} keyword={keyword} playwright status={status} url={final_url} "
-                    "falling back to requests"
-                )
+                self._error(f"site={site} keyword={keyword} playwright status={status} url={page.url}")
                 return None
+            # Wait for actual content (or an explicit empty state), not an arbitrary delay.
+            page.wait_for_function("""() => document.querySelector(
+                'a[href*="/activity/"], a[href*="/wd/"], a[href*="/recruit/"], a[href*="/RecruitInfoDetails/"]'
+            ) || /검색\\s*결과[\\s\\S]{0,40}(없|0\\s*건)|no results/i.test(document.body.innerText)""",
+                                   timeout=self.timeout * 1000)
+            html = page.content()
+            final_url = page.url
             self._log(
                 f"[fetch-js] site={site} keyword={keyword} status={status} "
                 f"bytes={len(html)} url={final_url}"
@@ -516,8 +540,8 @@ class JobCrawler:
             )
             return html, final_url
         except Exception as exc:
-            self._log(
-                f"[error] site={site} keyword={keyword} playwright request failed url={search_url} "
+            self._error(
+                f"site={site} keyword={keyword} playwright request failed url={search_url} "
                 f"reason={type(exc).__name__}: {exc}"
             )
             return None
@@ -546,8 +570,12 @@ class JobCrawler:
         postings: list[JobPosting] = []
 
         blocks: list[Tag] = []
+        seen_blocks: set[int] = set()
         for selector in cfg.get("containers", []):
-            blocks.extend(soup.select(selector))
+            for block in soup.select(selector):
+                if id(block) not in seen_blocks:
+                    blocks.append(block)
+                    seen_blocks.add(id(block))
         if not blocks:
             return postings
 
@@ -565,9 +593,16 @@ class JobCrawler:
 
             link = ""
             if link_node and link_node.get("href"):
-                link = self._normalize_url(urljoin(cfg["base_url"], link_node["href"]))
+                link = self._canonical_job_url(site, urljoin(cfg["base_url"], link_node["href"]))
+            if not link:
+                continue
+            job_links = {self._canonical_job_url(site, urljoin(cfg["base_url"], a["href"]))
+                         for a in block.select("a[href]")}
+            if len(job_links - {""}) > 1:
+                continue  # This is a list wrapper, not an individual job card.
 
-            text_blob = " ".join([title, company, location]).lower()
+            description = self._clean_text(block.get_text(" ", strip=True))
+            text_blob = " ".join([title, company, location, description]).lower()
             if not self._keyword_match(site=site, source_url=source_url, keyword=keyword, text_blob=text_blob):
                 continue
 
@@ -582,6 +617,7 @@ class JobCrawler:
                     link=link,
                     source_url=source_url,
                     collected_at=collected_at,
+                    description=description,
                 )
             )
 
@@ -598,7 +634,7 @@ class JobCrawler:
         postings: list[JobPosting] = []
         seen_links: set[str] = set()
 
-        for card in soup.select("div.dlua7o2"):
+        for card in soup.select('[data-sentry-component="CardJob"], div.dlua7o2'):
             job_links = card.select("a[href*='/Recruit/GI_Read/']")
             if not job_links:
                 continue
@@ -608,9 +644,10 @@ class JobCrawler:
             if not text_links:
                 continue
 
-            title = text_links[0]
+            title_node = card.select_one('[data-sentry-component="Title"]')
+            title = self._clean_text(title_node.get_text(" ", strip=True)) if title_node else text_links[0]
             company = text_links[1] if len(text_links) > 1 else ""
-            link = self._normalize_url(urljoin(SITE_CONFIGS["jobkorea"]["base_url"], job_links[0].get("href", "")))
+            link = self._canonical_job_url(site, urljoin(SITE_CONFIGS["jobkorea"]["base_url"], job_links[0].get("href", "")))
             if not link:
                 continue
             if link in seen_links:
@@ -654,6 +691,7 @@ class JobCrawler:
                     link=link,
                     source_url=source_url,
                     collected_at=collected_at,
+                    description=blob,
                 )
             )
 
@@ -676,10 +714,8 @@ class JobCrawler:
             if len(text) < 4:
                 continue
 
-            href = self._normalize_url(urljoin(base_url, anchor["href"]))
-            if site == "linkareer" and "/activity/" not in href:
-                continue
-            if site == "jasoseol" and "/recruit/" not in href:
+            href = self._canonical_job_url(site, urljoin(base_url, anchor["href"]))
+            if not href:
                 continue
             if not self._keyword_match(site=site, source_url=source_url, keyword=keyword, text_blob=text.lower()):
                 continue
@@ -764,163 +800,130 @@ class JobCrawler:
         return postings
 
     def _collect_jobs_from_json(
-        self,
-        payload: object,
-        site: str,
-        keyword: str,
-        base_url: str,
-        source_url: str,
-        collected_at: str,
+        self, payload: object, site: str, keyword: str, base_url: str,
+        source_url: str, collected_at: str,
     ) -> list[JobPosting]:
         postings: list[JobPosting] = []
         for node in self._walk_json(payload):
             if not isinstance(node, dict):
                 continue
-
-            title = self._pick_text(node, ["title", "name", "position", "jobTitle", "postingTitle"])
-            company = self._pick_text(node, ["companyName", "company", "corpName", "organizationName", "organization"])
-            location = self._pick_text(node, ["location", "region", "address", "workplace", "workLocation"])
-            deadline = self._pick_text(node, ["deadline", "closeDate", "endDate", "dueDate", "expiredAt"])
+            types = node.get("@type", [])
+            types = [types] if isinstance(types, str) else types
+            typed_job = isinstance(types, list) and "JobPosting" in types
+            if types and not typed_job:
+                continue
+            title = self._pick_text(node, ["title", "position", "jobTitle", "postingTitle"])
+            if typed_job and not title:
+                title = self._pick_text(node, ["name"])
             link = self._pick_text(node, ["url", "link", "href", "jobUrl", "postingUrl"])
-
-            if not title:
+            if site == "linkareer" and node.get("__typename") == "Activity":
+                activity_id = self._pick_text(node, ["id"])
+                if activity_id:
+                    link = f"{base_url}/activity/{activity_id}"
+            if typed_job and not link:
+                link = source_url  # Detail pages often omit their own URL.
+            link = self._canonical_job_url(site, urljoin(base_url, link)) if link else ""
+            if not title or not link:
                 continue
-            if not link:
+            company = self._pick_text(node, ["hiringOrganization", "companyName", "company", "corpName",
+                                             "organizationName", "organization"])
+            location = self._location_value(node.get("jobLocation")) or self._pick_text(
+                node, ["location", "region", "address", "workplace", "workLocation"])
+            deadline = self._pick_text(node, ["validThrough", "deadline", "closeDate", "endDate", "dueDate", "expiredAt"])
+            if site == "linkareer" and not deadline and isinstance(node.get("recruitCloseAt"), (int, float)):
+                try:
+                    deadline = datetime.fromtimestamp(node["recruitCloseAt"] / 1000, timezone.utc).isoformat()
+                except (ValueError, OverflowError, OSError):
+                    pass
+            description = self._plain_text(" ".join(self._pick_text(node, [key]) for key in
+                ("description", "responsibilities", "qualifications", "skills", "occupationalCategory")))
+            experience = self._pick_text(node, ["experienceRequirements", "experience"])
+            employment_type = self._pick_text(node, ["employmentType", "employment_type"])
+            blob = " ".join([title, company, location, description, experience, employment_type])
+            if not self._keyword_match(site, source_url, keyword, blob):
                 continue
-
-            normalized_link = self._normalize_url(urljoin(base_url, link))
-            if not self._looks_like_job_link(normalized_link):
-                continue
-
-            text_blob = " ".join([title, company, location]).lower()
-            if not self._keyword_match(site=site, source_url=source_url, keyword=keyword, text_blob=text_blob):
-                continue
-
-            postings.append(
-                JobPosting(
-                    site=site,
-                    keyword=keyword,
-                    title=title,
-                    company=company,
-                    location=location,
-                    deadline=deadline,
-                    link=normalized_link,
-                    source_url=source_url,
-                    collected_at=collected_at,
-                )
-            )
-
+            postings.append(JobPosting(site, keyword, title, company, location, deadline, link,
+                                       source_url, collected_at, description, experience, employment_type))
         return postings
 
+    def _location_value(self, value: object) -> str:
+        if isinstance(value, str):
+            return self._clean_text(value)
+        if isinstance(value, list):
+            return "; ".join(dict.fromkeys(filter(None, (self._location_value(v) for v in value))))
+        if isinstance(value, dict):
+            if "address" in value:
+                return self._location_value(value["address"])
+            parts = [self._pick_text(value, [key]) for key in
+                     ("addressCountry", "addressRegion", "addressLocality", "streetAddress")]
+            return " ".join(dict.fromkeys(filter(None, parts))) or self._pick_text(value, ["name"])
+        return ""
+
+    def _plain_text(self, value: str) -> str:
+        return self._clean_text(BeautifulSoup(value, "lxml").get_text(" ", strip=True)) if "<" in value else self._clean_text(value)
+
     def _extract_from_catch_api_payload(
-        self,
-        payload: object,
-        keyword: str,
-        source_url: str,
-        base_url: str,
+        self, payload: object, keyword: str, source_url: str, base_url: str,
     ) -> list[JobPosting]:
-        now = datetime.now(timezone.utc).isoformat()
+        rows = payload.get("recruitData", []) if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            return []
         postings: list[JobPosting] = []
-        for node in self._walk_json(payload):
+        now = datetime.now(timezone.utc).isoformat()
+        for node in rows:
             if not isinstance(node, dict):
                 continue
-
-            title = self._pick_text(node, ["recruitTitle", "title", "jobTitle", "name"])
-            company = self._pick_text(node, ["compName", "companyName", "company", "corpName"])
-            location = self._pick_text(node, ["WorkArea", "sidoName", "location", "region", "workPlace"])
-            apply_end_code = self._pick_text(node, ["ApplyEndCode"])
-            apply_end_datetime = self._pick_text(node, ["ApplyEndDatetime"])
-            dday = self._pick_text(node, ["Dday"])
-            deadline = ""
-            if apply_end_code:
-                deadline = apply_end_code
-            elif apply_end_datetime:
-                deadline = apply_end_datetime[:10]
-            elif dday:
-                deadline = f"D-{dday}"
-
-            if not title:
+            title = self._pick_text(node, ["recruitTitle", "title", "jobTitle"])
+            recruit_id = self._pick_text(node, ["recruitID", "id"])
+            link = self._canonical_job_url("catch", f"{base_url}/NCS/RecruitInfoDetails/{recruit_id}")
+            if not title or not link:
                 continue
-
-            recruit_id = self._pick_text(node, ["recruitID", "recruitId", "id", "idx"])
-            link = ""
-            if recruit_id:
-                link = f"{base_url}/NCS/RecruitInfoDetails/{recruit_id}"
-            if not link:
-                link = source_url
-
-            postings.append(
-                JobPosting(
-                    site="catch",
-                    keyword=keyword,
-                    title=title,
-                    company=company,
-                    location=location,
-                    deadline=deadline,
-                    link=link,
-                    source_url=source_url,
-                    collected_at=now,
-                )
-            )
-
+            deadline = self._pick_text(node, ["ApplyEndCode", "ApplyEndDatetime"])
+            dday = self._pick_text(node, ["Dday"])
+            if not deadline and dday and dday.isdigit():
+                deadline = f"D-{dday}"
+            experience = " / ".join(dict.fromkeys(filter(None, (
+                self._pick_text(node, ["NewbieText"]), self._pick_text(node, ["ExperienceText"]),
+                self._pick_text(node, ["ExperienceRange"]), self._pick_text(node, ["CareerGubunCode"]),
+            ))))
+            description = " / ".join(filter(None, (self._pick_text(node, ["Depth"]),
+                self._pick_text(node, ["AssignedTaskNameListString"]), self._pick_text(node, ["RecruitCategory"]))))
+            postings.append(JobPosting(
+                "catch", keyword, title, self._pick_text(node, ["compName", "companyName"]),
+                self._pick_text(node, ["WorkArea", "sidoName", "location"]), deadline, link, source_url, now,
+                description, experience, self._pick_text(node, ["GubunCode", "employmentType"]),
+            ))
         return postings
 
     def _extract_from_wanted_api_payload(
-        self,
-        payload: object,
-        keyword: str,
-        source_url: str,
-        base_url: str,
+        self, payload: object, keyword: str, source_url: str, base_url: str,
     ) -> list[JobPosting]:
-        now = datetime.now(timezone.utc).isoformat()
+        rows = payload.get("data", []) if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            return []
         postings: list[JobPosting] = []
-        for node in self._walk_json(payload):
+        now = datetime.now(timezone.utc).isoformat()
+        for node in rows:
             if not isinstance(node, dict):
                 continue
-
-            title = self._pick_text(node, ["title", "position", "positionTitle", "jobTitle", "name"])
-            annual_from_text = self._pick_text(node, ["annual_from", "annualFrom"])
-            annual_to_text = self._pick_text(node, ["annual_to", "annualTo"])
+            title = self._pick_text(node, ["position", "title", "positionTitle", "jobTitle"])
+            position_id = self._pick_text(node, ["id", "positionId"])
+            raw_link = self._pick_text(node, ["url", "link", "positionUrl", "jobUrl"])
+            link = self._canonical_job_url("wanted", urljoin(base_url, raw_link or f"/wd/{position_id}"))
+            if not title or not link:
+                continue
             employment_type = self._pick_text(node, ["employment_type", "employmentType"])
-            experience_hint = self._wanted_experience_hint(
-                annual_from_text=annual_from_text,
-                annual_to_text=annual_to_text,
-                employment_type=employment_type,
-            )
-            if title and experience_hint and experience_hint not in title:
-                title = f"{title} [{experience_hint}]"
-            company = self._pick_text(node, ["companyName", "company", "company_name", "name"])
-            location = self._pick_text(node, ["location", "address", "region", "country"])
-            deadline = self._pick_text(node, ["dueTime", "deadline", "closeDate", "endDate"])
-
-            if not title:
-                continue
-            text_blob = " ".join([title, company, location]).lower()
-            if keyword.lower() not in text_blob:
-                continue
-
-            link = self._pick_text(node, ["url", "link", "href", "positionUrl", "jobUrl"])
-            if not link:
-                position_id = self._pick_text(node, ["id", "positionId", "positionID"])
-                if position_id:
-                    link = f"{base_url}/wd/{position_id}"
-            if not link:
-                link = source_url
-
-            postings.append(
-                JobPosting(
-                    site="wanted",
-                    keyword=keyword,
-                    title=title,
-                    company=company,
-                    location=location,
-                    deadline=deadline,
-                    link=urljoin(base_url, link),
-                    source_url=source_url,
-                    collected_at=now,
-                )
-            )
-
+            experience = self._wanted_experience_hint(self._pick_text(node, ["annual_from", "annualFrom"]),
+                self._pick_text(node, ["annual_to", "annualTo"]), employment_type)
+            # Preserve the existing human-readable experience hint as well as structured fields.
+            if experience and experience not in title:
+                title = f"{title} [{experience}]"
+            postings.append(JobPosting(
+                "wanted", keyword, title, self._pick_text(node, ["companyName", "company", "company_name"]),
+                self._location_value(node.get("address")) or self._pick_text(node, ["location", "region"]),
+                self._pick_text(node, ["dueTime", "deadline", "closeDate", "endDate"]), link, source_url, now,
+                self._plain_text(self._pick_text(node, ["description", "responsibilities"])), experience, employment_type,
+            ))
         return postings
 
     def _wanted_experience_hint(self, annual_from_text: str, annual_to_text: str, employment_type: str) -> str:
@@ -970,53 +973,37 @@ class JobCrawler:
         return " / ".join(hint_parts)
 
     def _extract_from_jasoseol_api_payload(
-        self,
-        payload: object,
-        keyword: str,
-        source_url: str,
-        base_url: str,
+        self, payload: object, keyword: str, source_url: str, base_url: str,
     ) -> list[JobPosting]:
-        now = datetime.now(timezone.utc).isoformat()
-        postings: list[JobPosting] = []
         if not isinstance(payload, list):
-            return postings
-
+            return []
+        postings: list[JobPosting] = []
+        now = datetime.now(timezone.utc).isoformat()
         for node in payload:
             if not isinstance(node, dict):
                 continue
-
             title = self._pick_text(node, ["title"])
             company = self._pick_text(node, ["name"])
-            deadline = self._pick_text(node, ["end_time", "endTime"])
-            location = self._pick_text(node, ["location", "region", "work_area", "workArea"])
             recruit_id = self._pick_text(node, ["id"])
-            link = f"{base_url}/recruit/{recruit_id}" if recruit_id else source_url
-
-            if not title:
+            link = self._canonical_job_url("jasoseol", f"{base_url}/recruit/{recruit_id}")
+            roles = node.get("employments", [])
+            roles = [role for role in roles if isinstance(role, dict)] if isinstance(roles, list) else []
+            description = " / ".join(filter(None, [self._pick_text(node, ["description"])] +
+                                    [self._pick_text(role, ["field", "title"]) for role in roles]))
+            if not title or not link or not self._keyword_match("jasoseol", source_url, keyword,
+                                                                " ".join([title, company, description])):
                 continue
-            text_blob = " ".join([title, company]).lower()
-            if keyword.lower() not in text_blob and "hr" not in text_blob:
-                continue
-
-            postings.append(
-                JobPosting(
-                    site="jasoseol",
-                    keyword=keyword,
-                    title=title,
-                    company=company,
-                    location=location,
-                    deadline=deadline,
-                    link=link,
-                    source_url=source_url,
-                    collected_at=now,
-                )
-            )
+            experience = " / ".join(filter(None, [self._pick_text(role, ["experience", "career"]) for role in roles]))
+            employment_type = " / ".join(filter(None, [self._pick_text(role, ["work_type", "employment_type"]) for role in roles]))
+            postings.append(JobPosting(
+                "jasoseol", keyword, title, company, self._pick_text(node, ["location", "region", "work_area"]),
+                self._pick_text(node, ["end_time", "endTime"]), link, source_url, now,
+                description, experience, employment_type,
+            ))
         return postings
 
     def _keyword_match(self, site: str, source_url: str, keyword: str, text_blob: str) -> bool:
-        if site == "jasoseol" and "dutyGroupIds=115%2C117" in source_url:
-            return True
-        return keyword.lower() in text_blob
+        return keyword.casefold() in text_blob.casefold()
 
     def _extract_anchor_metadata(self, site: str, anchor: Tag, raw_text: str) -> tuple[str, str, str, str]:
         title = raw_text
@@ -1082,56 +1069,51 @@ class JobCrawler:
         return self._clean_text(match.group(0)) if match else ""
 
     def _enrich_wanted_posting(self, posting: JobPosting) -> JobPosting:
-        if posting.site != "wanted":
+        if posting.site != "wanted" or (posting.location and posting.deadline and posting.description):
             return posting
-        if posting.location and posting.deadline:
-            return posting
-        try:
-            response = self.session.get(posting.link, timeout=self.timeout)
-            response.raise_for_status()
-        except requests.RequestException:
-            return posting
-
-        self._dump_response(
-            site="wanted",
-            keyword=posting.keyword,
-            url=response.url,
-            content=response.text,
-            ext="html",
-            stage="detail",
-        )
-        soup = BeautifulSoup(response.text, "lxml")
-        location, deadline = self._extract_wanted_detail_fields(soup)
-        if location:
-            posting.location = location
-        if deadline:
-            posting.deadline = deadline
+        if posting.link in self._detail_cache:
+            fields = self._detail_cache[posting.link]
+        else:
+            response = self._get(posting.site, posting.keyword, posting.link, detail=True)
+            if response is None:
+                return posting
+            if self._canonical_job_url(posting.site, response.url) != posting.link:
+                self._error(f"site={posting.site} detail redirected away from job url={posting.link}")
+                self._detail_cache[posting.link] = {}
+                return posting
+            self._dump_response(posting.site, posting.keyword, response.url, response.text, "html", "detail")
+            soup = BeautifulSoup(response.text, "lxml")
+            records = self._extract_from_json_ld(soup, "wanted", "", SITE_CONFIGS["wanted"]["base_url"],
+                                                  posting.link, posting.collected_at)
+            fields = {}
+            for record in records:
+                if record.link == posting.link:
+                    fields = {key: getattr(record, key) for key in
+                              ("company", "location", "deadline", "description", "experience", "employment_type")}
+                    break
+            self._detail_cache[posting.link] = fields
+        for key, value in fields.items():
+            if value and not getattr(posting, key):
+                setattr(posting, key, value)
         return posting
 
     def _extract_wanted_detail_fields(self, soup: BeautifulSoup) -> tuple[str, str]:
         location = ""
         deadline = ""
         for script in soup.select("script[type='application/ld+json']"):
-            raw = script.string or script.get_text()
-            if not raw:
-                continue
             try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
+                payload = json.loads(script.string or script.get_text())
+            except (ValueError, TypeError):
                 continue
             for node in self._walk_json(payload):
                 if not isinstance(node, dict):
                     continue
-                node_type = str(node.get("@type", "")).lower()
-                if node_type != "jobposting":
+                types = node.get("@type", [])
+                types = [types] if isinstance(types, str) else types
+                if not isinstance(types, list) or "JobPosting" not in types:
                     continue
-                if not location:
-                    location = self._pick_text(node, ["jobLocation", "address", "addressLocality", "addressRegion"])
-                if not deadline:
-                    deadline = self._pick_text(node, ["validThrough", "datePosted"])
-        if not location:
-            txt = self._clean_text(soup.get_text(" ", strip=True))
-            location = self._extract_location_text(txt)
+                location = location or self._location_value(node.get("jobLocation"))
+                deadline = deadline or self._pick_text(node, ["validThrough"])
         return location, deadline
 
     def _pick_text(self, node: dict, keys: list[str]) -> str:
@@ -1149,6 +1131,10 @@ class JobCrawler:
                 nested = self._pick_text(value, ["name", "title", "value", "label"])
                 if nested:
                     return nested
+            if isinstance(value, list):
+                nested = [self._pick_text({"value": item}, ["value"]) for item in value]
+                if any(nested):
+                    return " / ".join(filter(None, nested))
         return ""
 
     @staticmethod
@@ -1184,11 +1170,6 @@ class JobCrawler:
                 yield from self._walk_json(item)
 
     @staticmethod
-    def _looks_like_job_link(link: str) -> bool:
-        lowered = link.lower()
-        return any(token in lowered for token in ["job", "recruit", "position", "posting", "hire"])
-
-    @staticmethod
     def _first_match(root: Tag, selectors: list[str]) -> Tag | None:
         for selector in selectors:
             node = root.select_one(selector)
@@ -1206,36 +1187,63 @@ class JobCrawler:
 
     @staticmethod
     def _normalize_url(url: str) -> str:
+        for site in SITE_CONFIGS:
+            canonical = JobCrawler._canonical_job_url(site, url)
+            if canonical:
+                return canonical
         parsed = urlparse(url)
-        query = [(k, v) for (k, v) in parse_qsl(parsed.query, keep_blank_values=True) if not k.startswith("utm_")]
-        cleaned = parsed._replace(query=urlencode(query), fragment="")
-        return urlunparse(cleaned)
+        query = sorted((k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+                       if not k.lower().startswith("utm_"))
+        return urlunparse(parsed._replace(query=urlencode(query), fragment=""))
+
+    @staticmethod
+    def _canonical_job_url(site: str, url: str) -> str:
+        parsed = urlparse(url)
+        expected = urlparse(SITE_CONFIGS[site]["base_url"])
+        if (parsed.scheme not in {"http", "https"} or parsed.username or parsed.password
+                or parsed.netloc.lower().removeprefix("www.") != expected.netloc.removeprefix("www.")):
+            return ""
+        patterns = {"wanted": r"/wd/(\d+)/?", "jobkorea": r"/Recruit/GI_Read/(\d+)/?",
+                    "linkareer": r"/activity/(\d+)/?", "jasoseol": r"/recruit/(\d+)/?",
+                    "catch": r"/NCS/RecruitInfoDetails/(\d+)/?"}
+        if site == "saramin":
+            job_id = dict(parse_qsl(parsed.query)).get("rec_idx", "")
+            if parsed.path.rstrip("/") == "/zf_user/jobs/relay/view" and job_id.isdigit():
+                return f"{SITE_CONFIGS[site]['base_url']}/zf_user/jobs/relay/view?rec_idx={job_id}"
+            return ""
+        match = re.fullmatch(patterns[site], parsed.path, re.IGNORECASE)
+        if not match:
+            return ""
+        paths = {"wanted": "/wd/", "jobkorea": "/Recruit/GI_Read/", "linkareer": "/activity/",
+                 "jasoseol": "/recruit/", "catch": "/NCS/RecruitInfoDetails/"}
+        return SITE_CONFIGS[site]["base_url"] + paths[site] + match.group(1)
 
     @staticmethod
     def _deduplicate(items: list[JobPosting]) -> list[JobPosting]:
-        deduped: list[JobPosting] = []
-        seen: set[tuple[str, str, str, str]] = set()
-
+        by_identity: dict[tuple[str, str], JobPosting] = {}
         for item in items:
-            key = (
-                item.site,
-                item.title.strip().lower(),
-                item.company.strip().lower(),
-                item.link.strip().lower(),
-            )
-            if key in seen:
+            canonical = JobCrawler._canonical_job_url(item.site, item.link)
+            if not canonical:
                 continue
-            seen.add(key)
-            deduped.append(item)
-
-        return deduped
+            item.link = canonical
+            item.matched_keywords = list(dict.fromkeys([*item.matched_keywords, *([item.keyword] if item.keyword else [])]))
+            key = (item.site, canonical)
+            existing = by_identity.get(key)
+            if existing is None:
+                by_identity[key] = item
+                continue
+            existing.matched_keywords = list(dict.fromkeys(existing.matched_keywords + item.matched_keywords))
+            for name in ("company", "location", "deadline", "description", "experience", "employment_type"):
+                if not getattr(existing, name) and getattr(item, name):
+                    setattr(existing, name, getattr(item, name))
+        return list(by_identity.values())
 
     def _log(self, message: str) -> None:
         if self._log_path is not None:
             now = datetime.now(timezone.utc).isoformat()
             with self._log_path.open("a", encoding="utf-8") as f:
                 f.write(f"{now} {message}\n")
-        if self.debug:
+        if self.debug or message.startswith(("[error]", "[warning]")):
             print(message, file=sys.stderr)
 
     def _dump_response(self, site: str, keyword: str, url: str, content: str, ext: str, stage: str) -> None:
@@ -1253,6 +1261,7 @@ class JobCrawler:
         self._log(f"[dump] saved={path} url={url}")
 
     def close(self) -> None:
+        self.session.close()
         if self._browser is not None:
             self._browser.close()
             self._browser = None

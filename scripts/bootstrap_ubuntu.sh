@@ -88,7 +88,7 @@ echo "[3/6] Create venv and install Python deps"
 run_cmd "cd \"${PROJECT_ROOT}\" && python3 -m venv .venv"
 run_cmd "cd \"${PROJECT_ROOT}\" && .venv/bin/python -m ensurepip --upgrade"
 run_cmd "cd \"${PROJECT_ROOT}\" && .venv/bin/python -m pip install --upgrade pip setuptools wheel"
-run_cmd "cd \"${PROJECT_ROOT}\" && .venv/bin/python -m pip install requests beautifulsoup4 lxml playwright python-dotenv"
+run_cmd "cd \"${PROJECT_ROOT}\" && .venv/bin/python -m pip install requests beautifulsoup4 lxml playwright python-dotenv 'openai>=2.0.0,<3'"
 
 if [[ "${WITH_PLAYWRIGHT}" == "1" ]]; then
   echo "[3.1/6] Install Playwright browser"

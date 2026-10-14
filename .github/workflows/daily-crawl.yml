@@ -1,0 +1,87 @@
+name: Daily crawl and email
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Approximately 09:00 Asia/Seoul; GitHub may delay scheduled jobs.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview the email without sending (crawl state is still saved)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# One writer across scheduled runs, manual runs, branches, and reruns.
+concurrency:
+  group: cheerupbot-crawl-state
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    if: github.event_name != 'schedule' || vars.JOB_SCHEDULE_ENABLED != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JOB_ENV_FILE: /dev/null
+      JOB_STATE_FILE: .crawl-state/state.sql
+      JOB_AGENT_FILTER_PROVIDER: openai
+      JOB_EMAIL_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+      JOB_RENDER_JS: '1'
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-6-luna' }}
+      OPENAI_REASONING_EFFORT: ${{ vars.OPENAI_REASONING_EFFORT || 'medium' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.23'
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Check required credentials
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import os
+          names = ['OPENAI_API_KEY']
+          if os.environ['JOB_EMAIL_DRY_RUN'] != '1':
+              names += ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD']
+          missing = [name for name in names if not os.getenv(name)]
+          if missing:
+              raise SystemExit('Missing GitHub Actions secrets: ' + ', '.join(missing))
+          PY
+      - name: Install Chromium
+        run: .venv/bin/python -m playwright install --with-deps chromium
+      - name: Restore SQL snapshot
+        id: restore
+        run: .venv/bin/python scripts/sync_crawl_state.py restore
+      - name: Crawl, filter, and email
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+        run: bash scripts/run_daily_email.sh
+      - name: Commit SQL snapshot
+        if: ${{ always() && steps.restore.outcome == 'success' }}
+        run: .venv/bin/python scripts/sync_crawl_state.py save
+      - name: Save reports and email preview
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/
+            .crawl-state/state.sql
+          if-no-files-found: ignore
+          retention-days: 14

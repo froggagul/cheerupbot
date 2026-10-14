@@ -1,0 +1,68 @@
+{
+  "data": [
+    {
+      "id": 371218,
+      "company": {
+        "id": 56940,
+        "name": "아마존(Amazon)",
+        "application_response_stats": {
+          "avg_rate": 0.0,
+          "level": "very_low"
+        }
+      },
+      "position": "HR Specialist, Amazon Corporate HR Partners",
+      "annual_from": 3,
+      "annual_to": 100,
+      "employment_type": "regular"
+    },
+    {
+      "id": 383668,
+      "company": {
+        "id": 50042,
+        "name": "아이즈",
+        "application_response_stats": {
+          "avg_rate": 0.0,
+          "level": "very_low"
+        }
+      },
+      "position": "HR Junior (HR Operations & General Affairs)",
+      "annual_from": 0,
+      "annual_to": 2,
+      "employment_type": "regular"
+    },
+    {
+      "id": 390263,
+      "company": {
+        "id": 39386,
+        "name": "밀도",
+        "application_response_stats": {
+          "avg_rate": 0.0,
+          "level": "very_low"
+        }
+      },
+      "position": "HR 담당자",
+      "annual_from": 3,
+      "annual_to": 7,
+      "employment_type": "regular"
+    },
+    {
+      "id": 340188,
+      "company": {
+        "id": 24566,
+        "name": "기어세컨드",
+        "application_response_stats": {
+          "avg_rate": 0.0,
+          "level": "very_low"
+        }
+      },
+      "position": "HR 담당자",
+      "annual_from": 0,
+      "annual_to": 8,
+      "employment_type": "regular"
+    }
+  ],
+  "total_count": 4,
+  "links": {
+    "next": null
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "recruitData": [
+    {
+      "RecruitID": 575673,
+      "RecruitTitle": "[BizPle] U.STRA HR 운영 개발자 채용",
+      "ApplyEndDatetime": "2026-11-12T14:59:59.000Z",
+      "CompName": "GS ITM",
+      "ApplyEndCode": "",
+      "Depth": "네트워크/서버/보안, 웹개발, ERP/시스템개발/설계",
+      "CareerGubunCode": "경력",
+      "NewbieText": null,
+      "ExperienceText": "경력",
+      "ExperienceRange": "4년↑",
+      "GubunCode": "정규직",
+      "WorkArea": "서울",
+      "Dday": 29,
+      "AssignedTaskNameListString": "U.STRA HR 운영 개발자"
+    },
+    {
+      "RecruitID": 575387,
+      "RecruitTitle": "[판교_본사] SAP 시스템 운영(HR 모듈) 채용",
+      "ApplyEndDatetime": "2026-11-29T14:59:59.000Z",
+      "CompName": "한국네트웍스",
+      "ApplyEndCode": "채용시 마감",
+      "Depth": "네트워크/서버/보안, ERP/시스템개발/설계",
+      "CareerGubunCode": "경력",
+      "NewbieText": null,
+      "ExperienceText": "경력",
+      "ExperienceRange": "5년↑",
+      "GubunCode": "정규직",
+      "WorkArea": "경기",
+      "Dday": 46,
+      "AssignedTaskNameListString": "SAP 시스템 운영(HR 모듈)"
+    },
+    {
+      "RecruitID": 575294,
+      "RecruitTitle": "오프라인 집합과정 운영자 채용(잠실,계약직)",
+      "ApplyEndDatetime": "2026-10-21T14:59:59.000Z",
+      "CompName": "멀티캠퍼스",
+      "ApplyEndCode": "",
+      "Depth": "교육기획/교재",
+      "CareerGubunCode": "경력무관",
+      "NewbieText": null,
+      "ExperienceText": "경력무관",
+      "ExperienceRange": null,
+      "GubunCode": "계약직",
+      "WorkArea": "서울",
+      "Dday": 7,
+      "AssignedTaskNameListString": "집합과정 운영자"
+    },
+    {
+      "RecruitID": 575200,
+      "RecruitTitle": "정부 HRD사업 전략기획·성과관리 기간제 채용 (음성)",
+      "ApplyEndDatetime": "2026-11-01T14:59:59.000Z",
+      "CompName": "HD건설기계",
+      "ApplyEndCode": "",
+      "Depth": "기획/전략/경영, 재무/세무/IR",
+      "CareerGubunCode": "경력",
+      "NewbieText": null,
+      "ExperienceText": "경력",
+      "ExperienceRange": "3년↑",
+      "GubunCode": "계약직",
+      "WorkArea": "충북",
+      "Dday": 18,
+      "AssignedTaskNameListString": "정부 HRD사업 전략기획·성과관리"
+    }
+  ],
+  "intTotalRecordCount": 4
+}

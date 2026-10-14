@@ -1,0 +1,26 @@
+{
+  "today": "2026-10-14",
+  "label_source": "Assistant-authored examples of filters/new_grad_prompt.txt; not human-labeled real postings. Labels fixed before candidate runs.",
+  "cases": [
+    {"case": "hr_intern_open", "posting": {"title": "채용 인턴", "deadline": "OPEN"}, "expected_keep": true, "rationale": "Recruiting internship; OPEN is an active job, not a talent pool."},
+    {"case": "missing_date_location", "posting": {"title": "인사팀 신입사원 채용", "deadline": "", "location": ""}, "expected_keep": true, "rationale": "Missing date and location alone must not exclude an explicit junior HR role."},
+    {"case": "mixed_departments", "posting": {"title": "신입/경력 공개채용 (R&D, HR, 구매)"}, "expected_keep": true, "rationale": "Mixed hiring includes an explicit HR path for new graduates."},
+    {"case": "hr_contract_exception", "posting": {"title": "인사팀 급여 운영 담당 계약직", "employment_type": "계약직"}, "expected_keep": true, "rationale": "Related contract role without required experience or management level."},
+    {"case": "required_experience", "posting": {"title": "HRD 계약직 담당자", "experience": "관련 경력 3년 이상 필수"}, "expected_keep": false, "rationale": "Mandatory experience overrides the contract exception."},
+    {"case": "preferred_experience", "posting": {"title": "HR 신입 담당자", "experience": "신입 지원 가능. 관련 인턴 경험 우대"}, "expected_keep": true, "rationale": "Preferred experience is not mandatory."},
+    {"case": "hr_ga_combined", "posting": {"title": "HR Junior (HR Operations & General Affairs)", "experience": "신입 가능"}, "expected_keep": false, "rationale": "Combined HR and general affairs is explicitly excluded."},
+    {"case": "sales_not_hrd", "posting": {"title": "HRD 기업교육 영업 담당 신입 채용"}, "expected_keep": false, "rationale": "The actual job is sales, even though its product is corporate training."},
+    {"case": "student_education", "posting": {"title": "교육 운영 인턴", "description": "대학생 대상 AI 부트캠프 수강생 관리 및 강의 일정 운영"}, "expected_keep": false, "rationale": "Student education is not employee training."},
+    {"case": "employee_training", "posting": {"title": "교육 운영 인턴", "description": "임직원 온보딩 교육, 사내 리더십 교육 및 HRD 프로그램 운영"}, "expected_keep": true, "rationale": "Explicit employee training and HRD internship."},
+    {"case": "culture_events", "posting": {"title": "문화 행사 및 예술 전시 기획 신입"}, "expected_keep": false, "rationale": "Arts and public cultural events are not organizational culture work."},
+    {"case": "organization_culture", "posting": {"title": "조직문화팀 신입", "description": "사내 구성원 소통 및 직원 몰입도 프로그램 운영"}, "expected_keep": true, "rationale": "Organizational culture and employee engagement."},
+    {"case": "expired", "posting": {"title": "채용팀 신입사원", "deadline": "2026-10-13"}, "expected_keep": false, "rationale": "Deadline is before the fixed evaluation date."},
+    {"case": "deadline_today", "posting": {"title": "채용팀 신입사원", "deadline": "2026-10-14"}, "expected_keep": true, "rationale": "A deadline today is allowed."},
+    {"case": "talent_pool", "posting": {"title": "HR 신입 상시 인재풀 등록", "deadline": "OPEN"}, "expected_keep": false, "rationale": "Talent pools are excluded even when OPEN."},
+    {"case": "unknown_duties_keyword_only", "posting": {"title": "부문별 신입/경력 채용", "keyword": "HR"}, "expected_keep": false, "rationale": "The search keyword does not establish HR duties."},
+    {"case": "unknown_entry_eligibility", "posting": {"title": "인사 담당자 채용", "employment_type": "정규직"}, "expected_keep": false, "rationale": "No evidence of junior eligibility and no contract exception."},
+    {"case": "junior_manager_word", "posting": {"title": "Junior Recruiting Coordinator", "description": "신입 가능. Hiring manager의 면접 일정 조율 및 채용 행정 지원"}, "expected_keep": true, "rationale": "Supporting a hiring manager does not make the applicant a manager."},
+    {"case": "hr_department_head", "posting": {"title": "인사팀장 계약직 채용"}, "expected_keep": false, "rationale": "Management level overrides the contract exception."},
+    {"case": "unknown_training_audience", "posting": {"title": "교육 콘텐츠 기획 신입", "keyword": "교육"}, "expected_keep": false, "rationale": "No evidence of employee training or HRD; do not guess the audience."}
+  ]
+}
