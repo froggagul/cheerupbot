@@ -338,6 +338,22 @@ python email_sender.py \
 
 ### GitHub Actions + 저장소에 보관하는 SQLite 상태
 
+The daily workflow runs on the desktop's self-hosted runner. See the
+[runner setup and operation guide](docs/self-hosted-runner.md).
+
+**All test emails must go only to `froggaguldev@gmail.com`.** Manual runs default
+to `dry_run=true` (no delivery) and `test_delivery=true`. To test actual delivery:
+
+```bash
+gh workflow run daily-crawl.yml --ref main -f dry_run=false -f test_delivery=true
+```
+
+Test delivery ignores `recipients.txt` and any other recipient arguments, sends
+only to the test address, and prefixes the subject with `[TEST]`. The email CLI
+also supports `--test-email`, and the daily shell script accepts `JOB_EMAIL_TEST=1`.
+For manual production delivery, explicitly set both `dry_run=false` and
+`test_delivery=false`. Scheduled production runs continue using `recipients.txt`.
+
 별도 DB 서버 없이 실행할 수 있습니다. 실행 중에는 Python 내장 SQLite를 메모리에서
 사용하고, 실행 사이에는 `crawl-state` 브랜치의 **`state.sql` 텍스트 파일**을 보관합니다.
 코드와 데이터는 서로 다른 브랜치에 저장되며 데이터 브랜치는 첫 실행 때 자동으로 생성됩니다.
@@ -373,7 +389,7 @@ GitHub PAT는 workflow secret으로 저장하지 않습니다. 상태 푸시는 
 
 - **수동 검증:** Actions → Daily crawl and email → Run workflow. 기본 `dry_run=true`는
   이메일을 보내지 않고 수집/필터/SQL 저장까지 수행합니다. HTML 미리보기와 보고서는 artifact에서 확인합니다.
-- **실제 발송:** 수동 실행에서 `dry_run`을 끕니다. 예약 실행은 매일 한국 시간 약 09:00에 시작합니다
+- **실제 발송:** 수동 실행에서 `dry_run`과 `test_delivery`를 모두 끄면 전체 수신자에게 발송합니다. 예약 실행은 매일 한국 시간 약 09:00에 시작합니다
   (`0 0 * * *` UTC). 수집/필터/SQL 푸시가 끝난 뒤 발송하므로 이메일은 그 이후 도착합니다.
   GitHub 예약 작업은 지연/누락될 수 있으며 정확한 시각을 보장하지 않습니다.
   예약 실행을 활성화하려면 이 workflow 파일이 기본 브랜치(`main`)에 있어야 합니다.
@@ -426,7 +442,7 @@ JOB_STATE_FILE=.crawl-state/state.sql JOB_EMAIL_DRY_RUN=1 bash scripts/run_daily
 ```
 
 `JOB_STATE_FILE`로 경로를 변경하고 빈 값(`JOB_STATE_FILE=`)으로 영속 상태를 끌 수 있습니다.
-restore 디렉터리는 비어 있어야 합니다. GitHub Actions는 매번 새 runner를 사용하므로 자동으로 충족합니다.
+restore 디렉터리는 비어 있어야 합니다. GitHub Actions는 runner 임시 경로 아래 실행 ID와 재시도 번호별로 별도 디렉터리를 사용합니다.
 서버 cron과 GitHub Actions를 동시에 예약하면 이메일이 중복될 수 있으므로 실행 위치는 하나만 선택하세요.
 
 검증:

@@ -19,6 +19,7 @@ class EmailSendError(RuntimeError):
 
 URL_PATTERN = re.compile(r"https?://[^\s<>'\"`]+")
 URL_TRAILING_PUNCT = ".,;:!?)]}>\"'"
+TEST_EMAIL_RECIPIENT = "froggaguldev@gmail.com"
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,6 +97,8 @@ def parse_args() -> argparse.Namespace:
         help="single: one email with all recipients in BCC, individual: one email per recipient",
     )
     parser.add_argument("--dry-run", action="store_true", help="Do not send; print summary only")
+    parser.add_argument("--test-email", action="store_true",
+                        help=f"Send only to {TEST_EMAIL_RECIPIENT}; ignore all other recipients and prefix the subject with [TEST]")
     parser.add_argument("--debug", action="store_true", help="Print debug logs")
     args = parser.parse_args()
     if args.preview_html and any(
@@ -284,7 +287,11 @@ def main() -> None:
                 raise EmailSendError(f"Failed to write HTML preview: {args.preview_html}") from exc
             print(f"Saved HTML preview to {args.preview_html}; no email sent.")
             return
-        recipients = _load_recipients(args.recipients_file, args.to)
+        if args.test_email:
+            recipients = [TEST_EMAIL_RECIPIENT]
+            args.subject = f"[TEST] {args.subject}"
+        else:
+            recipients = _load_recipients(args.recipients_file, args.to)
         sender = (args.from_email.strip() or args.smtp_user.strip() or "(unset)")
         if not args.dry_run:
             sender = _validate_sender(args.from_email, args.smtp_user)
@@ -309,9 +316,11 @@ def main() -> None:
                     body=body,
                     html_body=html_body,
                     reply_to=args.reply_to,
-                    use_bcc=True,
+                    use_bcc=not args.test_email,
                 )
-                client.send_message(msg)
+                # Explicit envelope recipients prevent the sender's display To header
+                # from receiving an unintended copy in BCC mode.
+                client.send_message(msg, to_addrs=recipients)
                 print(f"Sent 1 email to {len(recipients)} recipient(s).")
             else:
                 sent = 0
@@ -325,7 +334,7 @@ def main() -> None:
                         reply_to=args.reply_to,
                         use_bcc=False,
                     )
-                    client.send_message(msg)
+                    client.send_message(msg, to_addrs=[recipient])
                     sent += 1
                 print(f"Sent {sent} individual email(s).")
         finally:

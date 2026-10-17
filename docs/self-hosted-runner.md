@@ -51,7 +51,17 @@ gh api repos/froggagul/cheerupbot/actions/runners \
 
 # Full validation: save crawl state and preview the email, without delivery.
 gh workflow run daily-crawl.yml --ref main -f dry_run=true
+
+# Real test delivery: only froggaguldev@gmail.com receives the message.
+gh workflow run daily-crawl.yml --ref main -f dry_run=false -f test_delivery=true
 ```
+
+Manual runs default to both `dry_run=true` and `test_delivery=true`. All test
+emails must go only to `froggaguldev@gmail.com`. Test mode replaces all configured
+recipients and adds `[TEST]` to the subject. The SMTP envelope contains only that
+address, including when a different sender is configured. To send a manual
+production digest, explicitly set `dry_run=false` and `test_delivery=false`.
+Scheduled production runs continue to use `recipients.txt`.
 
 Existing repository secrets continue supplying the OpenAI and SMTP credentials.
 Scheduled runs remain at approximately 09:00 Asia/Seoul. Keep the computer awake

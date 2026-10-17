@@ -9,6 +9,10 @@ on:
         description: Preview the email without sending (crawl state is still saved)
         type: boolean
         default: true
+      test_delivery:
+        description: Send only to froggaguldev@gmail.com when dry_run is false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -28,6 +32,7 @@ jobs:
       JOB_ENV_FILE: /dev/null
       JOB_AGENT_FILTER_PROVIDER: openai
       JOB_EMAIL_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+      JOB_EMAIL_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test_delivery && '1' || '0' }}
       JOB_RENDER_JS: '1'
       OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-6-luna' }}
       OPENAI_REASONING_EFFORT: ${{ vars.OPENAI_REASONING_EFFORT || 'medium' }}
@@ -101,12 +106,17 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
         run: |
+          test_args=()
+          if [[ "$JOB_EMAIL_TEST" == '1' ]]; then
+            test_args+=(--test-email)
+          fi
           .venv/bin/python email_sender.py \
             --message-file out/jobs_message_latest.txt \
             --html-file out/jobs_message_latest.html \
             --subject '[알림] 오늘의 채용 요약' \
             --recipients-file recipients.txt \
             --send-mode single \
+            "${test_args[@]}" \
             --no-dotenv
       - name: Save reports and email preview
         if: ${{ always() && steps.checkout.outcome == 'success' }}

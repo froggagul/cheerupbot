@@ -121,6 +121,41 @@ class EmailFormatTests(unittest.TestCase):
                 self.assertEqual(smtp.return_value.send_message.call_count, count)
                 for call in smtp.return_value.send_message.call_args_list:
                     self.assertEqual(call.args[0].get_body(preferencelist=("html",)).get_content().strip(), "<h1>채용 요약</h1>")
+                delivered_to = [address for call in smtp.return_value.send_message.call_args_list
+                                for address in call.kwargs['to_addrs']]
+                self.assertEqual(delivered_to, ['a@example.com', 'b@example.com'])
+
+    def test_test_email_excludes_file_cli_and_sender_addresses_in_both_modes(self):
+        for mode in ('single', 'individual'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                recipient_file = Path(folder) / 'recipients.txt'
+                recipient_file.write_text('production@example.com\nother@example.com\n')
+                argv = ['email_sender.py', '--no-dotenv', '--message-text', 'Test digest',
+                        '--from-email', 'sender@example.com', '--subject', 'Digest',
+                        '--recipients-file', str(recipient_file), '--to', 'cli@example.com',
+                        '--send-mode', mode, '--test-email']
+                with patch('sys.argv', argv), patch('email_sender._connect_smtp') as smtp, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    email_sender.main()
+                smtp.return_value.send_message.assert_called_once()
+                call = smtp.return_value.send_message.call_args
+                self.assertEqual(call.kwargs['to_addrs'], ['froggaguldev@gmail.com'])
+                self.assertEqual(call.args[0]['To'], 'froggaguldev@gmail.com')
+                self.assertIsNone(call.args[0]['Cc'])
+                self.assertIsNone(call.args[0]['Bcc'])
+                self.assertEqual(call.args[0]['Subject'], '[TEST] Digest')
+
+    def test_test_email_dry_run_never_connects_smtp(self):
+        argv = ['email_sender.py', '--no-dotenv', '--message-text', 'Test digest',
+                '--test-email', '--dry-run', '--to', 'production@example.com']
+        output = io.StringIO()
+        with patch('sys.argv', argv), patch('email_sender._connect_smtp') as smtp, \
+                contextlib.redirect_stdout(output):
+            email_sender.main()
+        smtp.assert_not_called()
+        self.assertIn('recipients=1', output.getvalue())
+        self.assertIn('froggaguldev@gmail.com', output.getvalue())
+        self.assertNotIn('production@example.com', output.getvalue())
 
 
 if __name__ == "__main__":
