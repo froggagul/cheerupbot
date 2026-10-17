@@ -21,12 +21,11 @@ concurrency:
 jobs:
   crawl:
     if: github.event_name != 'schedule' || vars.JOB_SCHEDULE_ENABLED != 'false'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, cheerupbot]
     timeout-minutes: 45
     env:
       TZ: Asia/Seoul
       JOB_ENV_FILE: /dev/null
-      JOB_STATE_FILE: .crawl-state/state.sql
       JOB_AGENT_FILTER_PROVIDER: openai
       JOB_EMAIL_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
       JOB_RENDER_JS: '1'
@@ -34,15 +33,23 @@ jobs:
       OPENAI_REASONING_EFFORT: ${{ vars.OPENAI_REASONING_EFFORT || 'medium' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+        id: checkout
         with:
-          python-version: '3.10'
+          clean: true
+      - name: Prepare run paths
+        # A persistent runner must never reuse another run's restore directory.
+        run: |
+          state_dir="${RUNNER_TEMP}/cheerupbot-state-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'JOB_STATE_DIR=%s\nJOB_STATE_FILE=%s/state.sql\n' "$state_dir" "$state_dir" >> "$GITHUB_ENV"
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.12.23'
-          enable-cache: true
+          # The desktop already keeps its local uv cache between runs.
+          enable-cache: false
       - name: Install locked dependencies
-        run: uv sync --frozen
+        run: |
+          uv python install 3.10
+          uv sync --frozen --python 3.10 --managed-python
       - name: Check required credentials
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -59,11 +66,23 @@ jobs:
           if missing:
               raise SystemExit('Missing GitHub Actions secrets: ' + ', '.join(missing))
           PY
-      - name: Install Chromium
-        run: .venv/bin/python -m playwright install --with-deps chromium
+      - name: Install and verify Chromium
+        # System libraries are provisioned once on the desktop, without sudo in CI.
+        run: |
+          .venv/bin/python -m playwright install chromium
+          .venv/bin/python - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              page = browser.new_page()
+              page.set_content('<title>Runner browser check</title>')
+              assert page.title() == 'Runner browser check'
+              print('Chromium ready:', browser.version)
+              browser.close()
+          PY
       - name: Restore SQL snapshot
         id: restore
-        run: .venv/bin/python scripts/sync_crawl_state.py restore
+        run: .venv/bin/python scripts/sync_crawl_state.py restore --directory "$JOB_STATE_DIR"
       - name: Crawl, filter, and prepare email
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -72,7 +91,7 @@ jobs:
         run: bash scripts/run_daily_email.sh
       - name: Commit SQL snapshot
         if: ${{ always() && steps.restore.outcome == 'success' }}
-        run: .venv/bin/python scripts/sync_crawl_state.py save
+        run: .venv/bin/python scripts/sync_crawl_state.py save --directory "$JOB_STATE_DIR"
       - name: Send email via SMTP
         if: ${{ success() && env.JOB_EMAIL_DRY_RUN != '1' }}
         env:
@@ -90,12 +109,12 @@ jobs:
             --send-mode single \
             --no-dotenv
       - name: Save reports and email preview
-        if: ${{ always() }}
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: crawl-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             out/
-            .crawl-state/state.sql
+            ${{ env.JOB_STATE_FILE }}
           if-no-files-found: ignore
           retention-days: 14
