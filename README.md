@@ -350,6 +350,22 @@ Options:
 
 ### GitHub Actions and repository-backed SQLite state
 
+The daily workflow runs on the desktop's self-hosted runner. See the
+[runner setup and operation guide](docs/self-hosted-runner.md).
+
+**All test emails must go only to `froggaguldev@gmail.com`.** Manual runs default
+to `dry_run=true` (no delivery) and `test_delivery=true`. To test actual delivery:
+
+```bash
+gh workflow run daily-crawl.yml --ref main -f dry_run=false -f test_delivery=true
+```
+
+Test delivery ignores `recipients.txt` and any other recipient arguments, sends
+only to the test address, and prefixes the subject with `[TEST]`. The email CLI
+also supports `--test-email`, and the daily shell script accepts `JOB_EMAIL_TEST=1`.
+For manual production delivery, explicitly set both `dry_run=false` and
+`test_delivery=false`. Scheduled production runs continue using `recipients.txt`.
+
 No separate database server is required. During a run, Python's built-in SQLite operates in memory.
 Between runs, state is stored as a **`state.sql` text file** on the `crawl-state` branch.
 Code and data live on separate branches; the data branch is created automatically on the first run.
@@ -383,7 +399,7 @@ Do not store a GitHub PAT as a workflow secret. State pushes use the per-run `GI
 If repository/organization policies or branch rules block direct writes to `crawl-state`, pushes fail; allow automation to write to that data branch.
 
 - **Manual validation:** Actions → Daily crawl and email → Run workflow. The default `dry_run=true` performs collection, filtering, and SQL persistence without sending email. HTML previews and reports are available in the artifact.
-- **Live delivery:** disable `dry_run` for a manual run. Scheduled runs start at approximately 09:00 Korea time each day (`0 0 * * *` UTC). Email is sent after collection, filtering, and the SQL push finish. GitHub schedules can be delayed or skipped and do not guarantee an exact time. The workflow must exist on the default branch (`main`) for scheduled runs to operate.
+- **Live delivery:** explicitly disable both `dry_run` and `test_delivery` to send a manual run to all configured recipients. Scheduled runs start at approximately 09:00 Korea time each day (`0 0 * * *` UTC). Email is sent after collection, filtering, and the SQL push finish. GitHub schedules can be delayed or skipped and do not guarantee an exact time. The workflow must exist on the default branch (`main`) for scheduled runs to operate.
 - **Disable scheduling:** set the repository variable `JOB_SCHEDULE_ENABLED=false`. Manual runs remain available.
 - **Model configuration:** set repository variables `OPENAI_MODEL` and `OPENAI_REASONING_EFFORT`. Defaults are `gpt-6-luna` and `medium`.
 - **Overlapping runs:** a fixed concurrency group serializes the entire restore → crawl → push sequence. Runs wait for earlier runs to finish instead of canceling an active run.
@@ -429,7 +445,7 @@ JOB_STATE_FILE=.crawl-state/state.sql JOB_EMAIL_DRY_RUN=1 bash scripts/run_daily
 ```
 
 Change the path with `JOB_STATE_FILE`, or disable persistent state with an empty value (`JOB_STATE_FILE=`).
-The restore directory must be empty; GitHub Actions satisfies this by using a fresh runner for each run.
+The restore directory must be empty. GitHub Actions uses a separate directory under the runner temporary path for each run ID and attempt number.
 Choose one scheduling environment: scheduling both server cron and GitHub Actions can result in duplicate emails.
 
 Validation:

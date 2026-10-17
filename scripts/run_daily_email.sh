@@ -158,5 +158,8 @@ EMAIL_ARGS=(
 if [[ "${EMAIL_DRY_RUN}" == "1" ]]; then
   EMAIL_ARGS+=(--dry-run)
 fi
+if [[ "${JOB_EMAIL_TEST:-0}" == "1" ]]; then
+  EMAIL_ARGS+=(--test-email)
+fi
 
 "${EMAIL_ARGS[@]}"

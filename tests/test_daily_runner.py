@@ -76,6 +76,13 @@ with calls.open("a") as stream:
         self.assertEqual([row["title"] for row in rows], ["HR 인턴"])
         self.assertFalse((self.root / "calls.txt").exists())
 
+    def test_test_email_override_reaches_sender_without_production_recipients(self):
+        result = self.run_daily(JOB_EMAIL_TEST="1", JOB_AGENT_FILTER_PROVIDER="none")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        recipient_lines = [line.strip() for line in result.stdout.splitlines() if line.startswith(' - ')]
+        self.assertEqual(recipient_lines, ['- froggaguldev@gmail.com'])
+        self.assertIn('[TEST]', result.stdout)
+
     def test_default_openai_luna_medium_filters_once_and_records_effort(self):
         (self.root / ".env").write_text(
             "OPENAI_API_KEY=offline-test-only\nJOB_INPUT_JSON=input.json\nJOB_EMAIL_DRY_RUN=1\n"
