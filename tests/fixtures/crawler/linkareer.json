@@ -1,0 +1,172 @@
+{
+  "props": {
+    "pageProps": {
+      "__APOLLO_STATE__": {
+        "Activity:356625": {
+          "__typename": "Activity",
+          "id": "356625",
+          "title": "[크래프톤] 2027 채용연계형 인턴십",
+          "activityTypeID": 5,
+          "type": 5,
+          "organizationName": "크래프톤",
+          "jobTypes": [
+            "INTERN",
+            "NEW"
+          ],
+          "recruitInformations": [
+            {
+              "__ref": "RecruitInformation:210356"
+            },
+            {
+              "__ref": "RecruitInformation:210357"
+            },
+            {
+              "__ref": "RecruitInformation:210358"
+            },
+            {
+              "__ref": "RecruitInformation:210359"
+            },
+            {
+              "__ref": "RecruitInformation:210360"
+            },
+            {
+              "__ref": "RecruitInformation:210361"
+            }
+          ],
+          "categories": [
+            {
+              "__ref": "Category:101001"
+            },
+            {
+              "__ref": "Category:101004"
+            },
+            {
+              "__ref": "Category:103007"
+            },
+            {
+              "__ref": "Category:103008"
+            },
+            {
+              "__ref": "Category:103010"
+            }
+          ],
+          "regions": [
+            {
+              "__typename": "Region",
+              "id": "2",
+              "name": "서울"
+            }
+          ],
+          "recruitCloseAt": 1792767599999
+        },
+        "Category:101001": {
+          "__typename": "Category",
+          "id": "101001",
+          "name": "경영기획/전략",
+          "parent": {
+            "__ref": "Category:100001"
+          }
+        },
+        "Category:101004": {
+          "__typename": "Category",
+          "id": "101004",
+          "name": "인사/채용/노무",
+          "parent": {
+            "__ref": "Category:100001"
+          }
+        },
+        "Category:103007": {
+          "__typename": "Category",
+          "id": "103007",
+          "name": "AI/ML엔지니어",
+          "parent": {
+            "__ref": "Category:100003"
+          }
+        },
+        "Category:103008": {
+          "__typename": "Category",
+          "id": "103008",
+          "name": "IT기획/PM/PO",
+          "parent": {
+            "__ref": "Category:100003"
+          }
+        },
+        "Category:103010": {
+          "__typename": "Category",
+          "id": "103010",
+          "name": "게임개발/기획",
+          "parent": {
+            "__ref": "Category:100003"
+          }
+        },
+        "RecruitInformation:210356": {
+          "__typename": "RecruitInformation",
+          "id": "210356",
+          "jobType": "INTERN",
+          "internTypes": [
+            {
+              "__ref": "ActivityInternType:2"
+            }
+          ]
+        },
+        "RecruitInformation:210357": {
+          "__typename": "RecruitInformation",
+          "id": "210357",
+          "jobType": "INTERN",
+          "internTypes": [
+            {
+              "__ref": "ActivityInternType:2"
+            }
+          ]
+        },
+        "RecruitInformation:210358": {
+          "__typename": "RecruitInformation",
+          "id": "210358",
+          "jobType": "INTERN",
+          "internTypes": [
+            {
+              "__ref": "ActivityInternType:2"
+            }
+          ]
+        },
+        "RecruitInformation:210359": {
+          "__typename": "RecruitInformation",
+          "id": "210359",
+          "jobType": "NEW",
+          "internTypes": []
+        },
+        "RecruitInformation:210360": {
+          "__typename": "RecruitInformation",
+          "id": "210360",
+          "jobType": "INTERN",
+          "internTypes": [
+            {
+              "__ref": "ActivityInternType:2"
+            }
+          ]
+        },
+        "RecruitInformation:210361": {
+          "__typename": "RecruitInformation",
+          "id": "210361",
+          "jobType": "INTERN",
+          "internTypes": [
+            {
+              "__ref": "ActivityInternType:2"
+            }
+          ]
+        },
+        "ROOT_QUERY": {
+          "activities({\"filterBy\":{\"categoryIDs\":[\"101004\"]}})": {
+            "__typename": "ActivityConnection",
+            "totalCount": 1,
+            "nodes": [
+              {
+                "__ref": "Activity:356625"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

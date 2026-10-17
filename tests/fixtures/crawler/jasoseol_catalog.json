@@ -1,0 +1,44 @@
+[
+  {
+    "id": 106628,
+    "name": "크래프톤",
+    "title": "2027 채용연계형 인턴십",
+    "end_time": "2026-10-23T11:59:00.000+09:00",
+    "employments": [
+      {
+        "field": "Corporate",
+        "division": [
+          3
+        ],
+        "duty_group_ids": [
+          115,
+          122,
+          109,
+          111,
+          142,
+          128,
+          103,
+          104,
+          105,
+          107,
+          133
+        ],
+        "work_type": "풀타임"
+      },
+      {
+        "field": "Game Development - Programming",
+        "division": [
+          3
+        ],
+        "duty_group_ids": [
+          168,
+          176,
+          175,
+          164,
+          162
+        ],
+        "work_type": "풀타임"
+      }
+    ]
+  }
+]

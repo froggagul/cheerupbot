@@ -90,6 +90,12 @@ SITE_CONFIGS = {
     },
 }
 
+# Discovery aliases apply to site-owned role categories, never to company names
+# or broad titles such as "Corporate". Final eligibility is still filtered later.
+HR_CATEGORY_KEYWORDS = {"hr", "hrm", "hrd", "인사", "노무", "채용", "조직문화", "사내 교육", "직원 교육"}
+LINKAREER_HR_CATEGORY = "101004"  # 인사/채용/노무 (public recruitment category)
+JASOSEOL_DIVISIONS = {1: "신입", 2: "경력", 3: "인턴", 4: "계약직", 7: "교육"}
+
 
 @dataclass
 class JobPosting:
@@ -127,6 +133,8 @@ class CrawlOutcome:
     detail_requests: int = 0
     stop_reason: str = "exhausted"
     errors: list[str] = field(default_factory=list)
+    strategy: str = "keyword"
+    cache_hits: int = 0
 
 
 class JobCrawler:
@@ -163,6 +171,11 @@ class JobCrawler:
         self._active: CrawlOutcome | None = None
         self._request_times: dict[str, float] = {}
         self._detail_cache: dict[str, dict[str, str]] = {}
+        self._linkareer_pages: dict[str, tuple[dict, dict, str]] = {}
+        self._jasoseol_catalog: tuple[list, str] | None = None
+        self._jasoseol_categories: dict[str, str] = {}
+        self._jasoseol_categories_loaded = False
+        self._jasoseol_categories_error = ""
         self.js_sites = {"wanted", "linkareer", "jasoseol", "catch"}
         self._playwright = None
         self._browser = None
@@ -193,6 +206,11 @@ class JobCrawler:
             raise ValueError(f"Unknown site ids: {', '.join(sorted(unknown))}")
         self.outcomes = []
         self._detail_cache.clear()
+        self._linkareer_pages.clear()
+        self._jasoseol_catalog = None
+        self._jasoseol_categories.clear()
+        self._jasoseol_categories_loaded = False
+        self._jasoseol_categories_error = ""
         collected: list[JobPosting] = []
         for site in sites:
             for keyword in keywords:
@@ -261,6 +279,12 @@ class JobCrawler:
 
     def _crawl_site_keyword(self, site: str, keyword: str, limit_per_site: int) -> list[JobPosting]:
         cfg = SITE_CONFIGS[site]
+        if site == "linkareer" and keyword.casefold() in HR_CATEGORY_KEYWORDS:
+            category_jobs = self._crawl_linkareer_category(keyword, limit_per_site)
+            if category_jobs is not None:
+                return category_jobs
+            if self._active:
+                self._active.strategy = "category+keyword_fallback"
         api_crawlers = {"jasoseol": self._crawl_jasoseol_api, "wanted": self._crawl_wanted_api,
                         "catch": self._crawl_catch_api}
         collected: list[JobPosting] = []
@@ -325,6 +349,10 @@ class JobCrawler:
 
     def _extract_html(self, soup: BeautifulSoup, site: str, keyword: str, source_url: str) -> list[JobPosting]:
         cfg = SITE_CONFIGS[site]
+        if site == "linkareer":
+            parsed = self._linkareer_connection(soup)
+            if parsed is not None:
+                return self._extract_linkareer_connection(*parsed, keyword, source_url)
         now = datetime.now(timezone.utc).isoformat()
         args = (soup, site, keyword, cfg["base_url"], source_url, now)
         postings = self._extract_from_json_ld(*args)
@@ -417,10 +445,166 @@ class JobCrawler:
         return collected[:limit]
 
     def _crawl_jasoseol_api(self, keyword: str, limit_per_site: int, cfg: dict) -> list[JobPosting]:
-        return self._api_pages("jasoseol", keyword, cfg, {
-            "field_query": keyword, "all": "true",
-            "after_end_time": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT"),
-        }, limit_per_site, None, self._extract_from_jasoseol_api_payload)
+        if self._active:
+            self._active.strategy = "active_catalog"
+        if self._jasoseol_catalog is None:
+            response = self._get("jasoseol", keyword, cfg["api_url"], params={
+                "all": "true",
+                "after_end_time": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            })
+            if response is None:
+                return []
+            self._dump_response("jasoseol", keyword, response.url, response.text, "json", "catalog")
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if not isinstance(payload, list) or (payload and not self._extract_from_jasoseol_api_payload(
+                    payload, "", response.url, cfg["base_url"])):
+                self._error("site=jasoseol invalid active catalog schema")
+                return []
+            self._jasoseol_catalog = payload, response.url
+        elif self._active:
+            self._active.cache_hits += 1
+        self._page_succeeded()
+        # Resolve duty IDs from the live taxonomy instead of guessing from labels.
+        if self._jasoseol_catalog[0] and not self._jasoseol_categories_loaded:
+            response = self._get("jasoseol", keyword, cfg["base_url"] + "/api/v1/duty-groups")
+            if response is not None:
+                self._jasoseol_categories_loaded = True
+                self._dump_response("jasoseol", keyword, response.url, response.text, "json", "categories")
+                try:
+                    categories = response.json()
+                except ValueError:
+                    categories = None
+                if isinstance(categories, list) and categories and all(
+                        isinstance(c, dict) and c.get("id") and isinstance(c.get("name"), str) for c in categories):
+                    self._jasoseol_categories = {str(c["id"]): c["name"] for c in categories}
+                else:
+                    self._jasoseol_categories_error = "site=jasoseol invalid duty category schema; using literal matches only"
+        if self._jasoseol_categories_error:
+            self._error(self._jasoseol_categories_error)
+        payload, source_url = self._jasoseol_catalog
+        rows = self._extract_from_jasoseol_api_payload(payload, keyword, source_url, cfg["base_url"])
+        if len(rows) > limit_per_site and self._active:
+            self._active.stop_reason = "candidate_limit"
+        return rows[:limit_per_site]
+
+    @staticmethod
+    def _category_terms(keyword: str) -> tuple[str, ...]:
+        if keyword.casefold() in HR_CATEGORY_KEYWORDS:
+            return (keyword.casefold(), "인사", "노무", "hr")
+        return (keyword.casefold(),)
+
+    def _linkareer_connection(self, soup: BeautifulSoup) -> tuple[dict, dict] | None:
+        script = soup.find("script", id="__NEXT_DATA__")
+        if not script:
+            return None
+        try:
+            payload = json.loads(script.string or script.get_text())
+        except ValueError:
+            return None
+        for cache in self._walk_json(payload):
+            if not isinstance(cache, dict) or not isinstance(cache.get("ROOT_QUERY"), dict):
+                continue
+            for key, connection in cache["ROOT_QUERY"].items():
+                if (key.startswith(("activities(", "activitySearch(")) and isinstance(connection, dict)
+                        and isinstance(connection.get("nodes"), list)):
+                    return cache, connection
+        return None
+
+    def _crawl_linkareer_category(self, keyword: str, limit: int) -> list[JobPosting] | None:
+        if self._active:
+            self._active.strategy = "category"
+        collected: list[JobPosting] = []
+        seen: set[tuple[str, ...]] = set()
+        consumed = 0
+        for page in range(1, self.max_pages + 1):
+            url = "https://linkareer.com/list/recruit?" + urlencode({
+                "filterBy_categoryIDs": LINKAREER_HR_CATEGORY, "filterBy_status": "OPEN",
+                "orderBy_direction": "DESC", "orderBy_field": "RECENT", "page": page,
+            })
+            cached = self._linkareer_pages.get(url)
+            if cached is None:
+                fetched = self._fetch_html("linkareer", keyword, url)
+                if fetched is None:
+                    return collected if seen else None  # Try keyword search within the remaining budget.
+                html, final_url = fetched
+                parsed = self._linkareer_connection(BeautifulSoup(html, "lxml"))
+                if parsed is None:
+                    self._error(f"site=linkareer unrecognized category listing url={final_url}")
+                    return collected if seen else None
+                cache, connection = parsed
+                self._linkareer_pages[url] = cache, connection, final_url
+            else:
+                cache, connection, final_url = cached
+                if self._active:
+                    self._active.cache_hits += 1
+            rows = self._extract_linkareer_connection(cache, connection, keyword, final_url, category_search=True)
+            if connection["nodes"] and not rows:
+                self._error(f"site=linkareer category records have no valid job identities url={final_url}")
+                return collected if seen else None
+            self._page_succeeded()
+            fingerprint = tuple(sorted(row.link for row in rows))
+            if fingerprint and fingerprint in seen:
+                if self._active:
+                    self._active.stop_reason = "repeated_page"
+                break
+            seen.add(fingerprint)
+            collected = self._deduplicate(collected + rows)
+            consumed += len(connection["nodes"])
+            total = self._parse_int(str(connection.get("totalCount", "")))
+            if not connection["nodes"] or (total is not None and consumed >= total):
+                break
+            if len(collected) >= limit:
+                if self._active:
+                    self._active.stop_reason = "candidate_limit"
+                break
+            if page == self.max_pages and self._active:
+                self._active.stop_reason = "page_budget"
+        return collected[:limit]
+
+    def _extract_linkareer_connection(self, cache: dict, connection: dict, keyword: str,
+                                      source_url: str, *, category_search: bool = False) -> list[JobPosting]:
+        def resolve(value: object) -> dict:
+            if not isinstance(value, dict):
+                return {}
+            node = cache.get(value["__ref"], {}) if "__ref" in value else value
+            return node if isinstance(node, dict) else {}
+
+        postings: list[JobPosting] = []
+        now = datetime.now(timezone.utc).isoformat()
+        for entry in connection["nodes"]:
+            node = resolve(entry)
+            if "source" in node:
+                node = resolve(node["source"])
+            if node.get("__typename") != "Activity" or str(node.get("activityTypeID", node.get("type"))) != "5":
+                continue
+            link = self._canonical_job_url("linkareer", f'https://linkareer.com/activity/{node.get("id", "")}')
+            title = self._pick_text(node, ["title"])
+            if not link or not title:
+                continue
+            categories = [self._pick_text(resolve(ref), ["name"]) for ref in node.get("categories", [])]
+            roles = [resolve(ref) for ref in node.get("recruitInformations", [])]
+            description = " / ".join(filter(None, categories + [self._pick_text(role, ["title", "name"]) for role in roles]))
+            company = self._pick_text(node, ["organizationName"])
+            if not category_search and not self._keyword_match("linkareer", source_url, keyword,
+                                                                " ".join([title, company, description])):
+                continue
+            job_types = list(dict.fromkeys(node.get("jobTypes", []) + [r.get("jobType", "") for r in roles]))
+            labels = {"NEW": "신입", "EXPERIENCED": "경력", "INTERN": "인턴", "CONTRACT": "계약직"}
+            experience = " / ".join(labels[t] for t in job_types if t in {"NEW", "EXPERIENCED"})
+            employment = " / ".join(labels[t] for t in job_types if t in {"INTERN", "CONTRACT"})
+            location = " / ".join(filter(None, [self._pick_text(resolve(r), ["name"]) for r in node.get("regions", [])]))
+            deadline = ""
+            if isinstance(node.get("recruitCloseAt"), (int, float)):
+                try:
+                    deadline = datetime.fromtimestamp(node["recruitCloseAt"] / 1000, timezone.utc).isoformat()
+                except (ValueError, OverflowError, OSError):
+                    pass
+            postings.append(JobPosting("linkareer", keyword, title, company, location, deadline, link,
+                                       source_url, now, description, experience, employment))
+        return postings
 
     def _extract_jasoseol_results(
         self,
@@ -988,13 +1172,35 @@ class JobCrawler:
             link = self._canonical_job_url("jasoseol", f"{base_url}/recruit/{recruit_id}")
             roles = node.get("employments", [])
             roles = [role for role in roles if isinstance(role, dict)] if isinstance(roles, list) else []
+            role_descriptions: list[str] = []
+            category_names: list[str] = []
+            divisions: list[str] = []
+            for role in roles:
+                ids = role.get("duty_group_ids", [])
+                names = list(dict.fromkeys(self._jasoseol_categories[str(category_id)] for category_id in ids
+                                          if str(category_id) in self._jasoseol_categories)) if isinstance(ids, list) else []
+                category_names.extend(names)
+                role_text = self._pick_text(role, ["field", "title"])
+                codes = role.get("division", [])
+                role_divisions = [JASOSEOL_DIVISIONS[code] for code in codes
+                                  if isinstance(code, int) and code in JASOSEOL_DIVISIONS] if isinstance(codes, list) else []
+                divisions.extend(role_divisions)
+                if role_divisions:
+                    role_text += " [" + ", ".join(role_divisions) + "]"
+                if names:
+                    role_text += " (직무 분류: " + ", ".join(names) + ")"
+                role_descriptions.append(role_text)
             description = " / ".join(filter(None, [self._pick_text(node, ["description"])] +
-                                    [self._pick_text(role, ["field", "title"]) for role in roles]))
-            if not title or not link or not self._keyword_match("jasoseol", source_url, keyword,
-                                                                " ".join([title, company, description])):
+                                    role_descriptions))
+            literal_match = self._keyword_match("jasoseol", source_url, keyword, " ".join([title, company, description]))
+            category_match = any(term in name.casefold() for name in category_names for term in self._category_terms(keyword))
+            if not title or not link or not (literal_match or category_match):
                 continue
-            experience = " / ".join(filter(None, [self._pick_text(role, ["experience", "career"]) for role in roles]))
-            employment_type = " / ".join(filter(None, [self._pick_text(role, ["work_type", "employment_type"]) for role in roles]))
+            experience = " / ".join(dict.fromkeys(filter(None, [self._pick_text(role, ["experience", "career"]) for role in roles])))
+            employment_type = " / ".join(dict.fromkeys(filter(None, [self._pick_text(role, ["work_type", "employment_type"]) for role in roles])))
+            experience = experience or " / ".join(dict.fromkeys(d for d in divisions if d in {"신입", "경력"}))
+            employment_type = " / ".join(dict.fromkeys(filter(None, [employment_type] +
+                                        [d for d in divisions if d in {"인턴", "계약직", "교육"}])))
             postings.append(JobPosting(
                 "jasoseol", keyword, title, company, self._pick_text(node, ["location", "region", "work_area"]),
                 self._pick_text(node, ["end_time", "endTime"]), link, source_url, now,

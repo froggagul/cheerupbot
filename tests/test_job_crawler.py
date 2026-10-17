@@ -33,6 +33,17 @@ def wanted_page(ids, total=100):
                      for i in ids], 'total_count': total}
 
 
+def linkareer_page(job_id=356625, total=1):
+    payload = json.loads((FIXTURES / 'linkareer.json').read_text())
+    cache = payload['props']['pageProps']['__APOLLO_STATE__']
+    node = cache.pop('Activity:356625')
+    node['id'] = str(job_id)
+    cache[f'Activity:{job_id}'] = node
+    connection = next(iter(cache['ROOT_QUERY'].values()))
+    connection.update(totalCount=total, nodes=[{'__ref': f'Activity:{job_id}'}])
+    return '<script id="__NEXT_DATA__" type="application/json">' + json.dumps(payload) + '</script>'
+
+
 def posting(site='wanted', keyword='HR', title='HR role', job_id=1, **kwargs):
     paths = {'wanted': f'/wd/{job_id}', 'saramin': f'/zf_user/jobs/relay/view?rec_idx={job_id}'}
     return JobPosting(site, keyword, title, '', '', '', SITE_CONFIGS[site]['base_url'] + paths[site], '', NOW, **kwargs)
@@ -77,6 +88,103 @@ class CrawlerTests(unittest.TestCase):
         self.assertIn('4년', rows[0].experience)
         self.assertEqual(rows[0].employment_type, '정규직')
         self.assertIn('ERP', rows[0].description)
+
+    def test_linkareer_discovers_bundled_recruitment_by_category_and_reuses_pages(self):
+        crawler = self.crawler()
+        with patch.object(crawler.session, 'get', side_effect=[
+            response(linkareer_page(100, total=2)), response(linkareer_page(total=2))]) as get:
+            rows = crawler.crawl(['linkareer'], ['HR', '인사'], 60)
+        self.assertEqual(get.call_count, 2)
+        self.assertTrue(all('/list/recruit?' in call.args[0] for call in get.call_args_list))
+        self.assertIn('filterBy_categoryIDs=101004', get.call_args_list[0].args[0])
+        self.assertIn('page=2', get.call_args_list[1].args[0])
+        row = next(row for row in rows if row.link.endswith('/356625'))
+        self.assertNotIn('인사', row.title)
+        self.assertIn('인사/채용/노무', row.description)
+        self.assertEqual((row.company, row.experience, row.employment_type, row.location), ('크래프톤', '신입', '인턴', '서울'))
+        self.assertEqual(row.matched_keywords, ['HR', '인사'])
+        self.assertEqual(crawler.outcomes[1].cache_hits, 2)
+        self.assertEqual(crawler.outcomes[1].requests, 0)
+
+    def test_linkareer_only_reads_main_results_and_resolves_missing_references(self):
+        crawler = self.crawler()
+        payload = json.loads((FIXTURES / 'linkareer.json').read_text())
+        cache = payload['props']['pageProps']['__APOLLO_STATE__']
+        cache['Activity:999'] = dict(cache['Activity:356625'], id='999', title='HR sidebar advertisement')
+        cache['Activity:356625']['categories'].append({'__ref': 'Category:missing'})
+        soup = BeautifulSoup('<script id="__NEXT_DATA__">' + json.dumps(payload) + '</script>', 'lxml')
+        rows = crawler._extract_html(soup, 'linkareer', '인사', 'https://linkareer.com/search')
+        self.assertEqual([row.link for row in rows], ['https://linkareer.com/activity/356625'])
+        self.assertEqual(crawler._extract_html(soup, 'linkareer', 'unrelated', 'https://linkareer.com/search'), [])
+
+    def test_linkareer_category_page_budget_and_repeated_pages(self):
+        for budget, requests_count, reason in [(1, 1, 'page_budget'), (3, 2, 'repeated_page')]:
+            with self.subTest(budget=budget):
+                crawler = self.crawler(max_pages=budget)
+                with patch.object(crawler.session, 'get', return_value=response(linkareer_page(total=50))) as get:
+                    rows = crawler.crawl(['linkareer'], ['HR'], 60)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(get.call_count, requests_count)
+                self.assertEqual(crawler.outcomes[0].stop_reason, reason)
+
+    def test_linkareer_empty_category_and_keyword_fallback(self):
+        crawler = self.crawler()
+        payload = json.loads((FIXTURES / 'linkareer.json').read_text())
+        connection = next(iter(payload['props']['pageProps']['__APOLLO_STATE__']['ROOT_QUERY'].values()))
+        connection.update(totalCount=0, nodes=[])
+        html = '<script id="__NEXT_DATA__">' + json.dumps(payload) + '</script>'
+        with patch.object(crawler.session, 'get', return_value=response(html)) as get:
+            self.assertEqual(crawler.crawl(['linkareer'], ['HR']), [])
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(crawler.outcomes[0].status, 'empty')
+        with contextlib.redirect_stderr(io.StringIO()), patch.object(crawler.session, 'get', side_effect=[
+            response('Unavailable', status=503), response('<a href="/activity/1">HR job</a>')]):
+            rows = crawler.crawl(['linkareer'], ['HR'], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(crawler.outcomes[0].status, 'partial')
+        self.assertEqual(crawler.outcomes[0].strategy, 'category+keyword_fallback')
+
+    def test_jasoseol_discovers_corporate_hr_from_catalog_and_live_taxonomy(self):
+        crawler = self.crawler()
+        catalog = json.loads((FIXTURES / 'jasoseol_catalog.json').read_text())
+        categories = json.loads((FIXTURES / 'jasoseol_categories.json').read_text())
+        # A generic Corporate label with only engineering categories is not HR.
+        unrelated = dict(catalog[0], id=999, name='Other company')
+        unrelated['employments'] = [dict(catalog[0]['employments'][0], duty_group_ids=[168])]
+        catalog.append(unrelated)
+        with patch.object(crawler.session, 'get', side_effect=[response(catalog), response(categories)]) as get:
+            rows = crawler.crawl(['jasoseol'], ['HR', '인사', 'unrelated'], 60)
+        self.assertEqual(get.call_count, 2)
+        self.assertNotIn('field_query', get.call_args_list[0].kwargs['params'])
+        self.assertEqual(get.call_args_list[0].kwargs['params']['all'], 'true')
+        self.assertIn('after_end_time', get.call_args_list[0].kwargs['params'])
+        self.assertEqual([r.company for r in rows], ['크래프톤'])
+        self.assertIn('Corporate [인턴] (직무 분류: 인사', rows[0].description)
+        self.assertIn('인턴', rows[0].employment_type)
+        self.assertEqual(rows[0].matched_keywords, ['HR', '인사'])
+        self.assertEqual(crawler.outcomes[1].requests, 0)
+        self.assertEqual(crawler.outcomes[2].status, 'empty')
+
+    def test_jasoseol_missing_taxonomy_keeps_literal_matches_without_guessing(self):
+        crawler = self.crawler()
+        catalog = json.loads((FIXTURES / 'jasoseol_catalog.json').read_text())
+        catalog.append({'id': 1, 'name': 'Example', 'title': 'HR intern', 'employments': []})
+        with contextlib.redirect_stderr(io.StringIO()), patch.object(crawler.session, 'get', side_effect=[
+            response(catalog), response({'unexpected': []})]):
+            rows = crawler.crawl(['jasoseol'], ['HR', '인사'], 60)
+        self.assertEqual([r.company for r in rows], ['Example'])
+        self.assertEqual([o.status for o in crawler.outcomes], ['partial', 'partial'])
+
+    def test_jasoseol_catalog_respects_budgets_and_refreshes_on_next_run(self):
+        crawler = self.crawler(max_requests=1)
+        catalog = [{'id': 1, 'name': 'Example', 'title': 'HR intern'}]
+        with patch.object(crawler.session, 'get', return_value=response(catalog)) as get:
+            self.assertEqual(len(crawler.crawl(['jasoseol'], ['HR'])), 1)
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(crawler.outcomes[0].stop_reason, 'request_budget')
+        with patch.object(crawler.session, 'get', return_value=response([])) as get:
+            self.assertEqual(crawler.crawl(['jasoseol'], ['HR']), [])
+        self.assertEqual(get.call_count, 1)
 
     def test_overlapping_containers_do_not_consume_limit(self):
         crawler = self.crawler()
@@ -152,11 +260,11 @@ class CrawlerTests(unittest.TestCase):
 
     def test_html_follows_next_page(self):
         crawler = self.crawler()
-        first = '<a href="/activity/1">HR first</a><a href="/search?q=HR&page=2">2</a>'
-        second = '<a href="/activity/2">HR second</a>'
-        with patch.object(crawler.session, 'get', side_effect=[response(first, 'https://linkareer.com/search?q=HR&page=1'),
-                                                              response(second, 'https://linkareer.com/search?q=HR&page=2')]) as get:
-            rows = crawler.crawl(['linkareer'], ['HR'], 2)
+        first = '<a href="/activity/1">Engineer first</a><a href="/search?q=Engineer&page=2">2</a>'
+        second = '<a href="/activity/2">Engineer second</a>'
+        with patch.object(crawler.session, 'get', side_effect=[response(first, 'https://linkareer.com/search?q=Engineer&page=1'),
+                                                              response(second, 'https://linkareer.com/search?q=Engineer&page=2')]) as get:
+            rows = crawler.crawl(['linkareer'], ['Engineer'], 2)
         self.assertEqual(len(rows), 2)
         self.assertIn('page=2', get.call_args_list[1].args[0])
 
@@ -239,8 +347,8 @@ class CrawlerTests(unittest.TestCase):
         page.goto.side_effect = RuntimeError('browser unavailable')
         context = Mock()
         with patch.object(crawler, '_new_page', return_value=(context, page)), contextlib.redirect_stderr(io.StringIO()):
-            with patch.object(crawler.session, 'get', return_value=response('<a href="/activity/1">HR job</a>', 'https://linkareer.com/search')):
-                rows = crawler.crawl(['linkareer'], ['HR'], 1)
+            with patch.object(crawler.session, 'get', return_value=response('<a href="/activity/1">Engineer job</a>', 'https://linkareer.com/search')):
+                rows = crawler.crawl(['linkareer'], ['Engineer'], 1)
         self.assertEqual(len(rows), 1)
         self.assertEqual(crawler.outcomes[0].status, 'partial')
         self.assertEqual(crawler.outcomes[0].requests, 2)
