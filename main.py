@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from agent_client import AgentError, create_agent_client
 from agent_filter import AgentJobFilter
-from crawl_state import CrawlState, StateError
+from crawl_state import CrawlState, StateError, deadline_has_passed
 from job_filters import FilterSpecError, build_filter_predicate, load_filter_spec, load_plugin_predicates
 from job_crawler import DEFAULT_SITES, CrawlError, JobCrawler
 from message_formatter import render_jobs_email_html, render_jobs_message
@@ -459,7 +459,14 @@ def _run(args: argparse.Namespace, state: CrawlState | None) -> None:
         payload = _crawl_payload(args)
     payload = _normalize_payload_deadlines(payload)
     if state is not None:
-        state.record(payload)
+        observed_at = datetime.now(timezone.utc)
+        state.record(payload, now=observed_at.isoformat(timespec="seconds"))
+        cleaned = state.cleanup(now=observed_at)
+        print(f"[state-cleanup] expired={cleaned['expired']} unseen_7_days={cleaned['stale']} "
+              f"remaining={cleaned['remaining']}", file=sys.stderr)
+        # Expired rows must not recreate cached decisions for deleted jobs or enter the email.
+        today = observed_at.astimezone(KST).date()
+        payload = [row for row in payload if not deadline_has_passed(row, today)]
     payload = _apply_filters(payload, args)
     if agent is not None:
         try:

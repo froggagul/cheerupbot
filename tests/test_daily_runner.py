@@ -5,7 +5,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from crawl_state import CrawlState
 
 
 class DailyRunnerTests(unittest.TestCase):
@@ -120,6 +123,52 @@ class OpenAI:
         self.assertNotIn("SMTP_", snapshot)
         self.assertEqual(len(json.loads((self.root / "out/jobs_latest.json").read_text())), 2)
 
+    def test_daily_cleanup_persists_and_excludes_expired_jobs_before_agent_and_email(self):
+        source = self.root / "input.json"
+        rows = json.loads(source.read_text())
+        rows.extend([{"title": "Stale job", "link": "https://example.com/3"},
+                     {"title": "Recently missing job", "link": "https://example.com/4"}])
+        source.write_text(json.dumps(rows))
+        result = self.run_daily()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        now = datetime.now(timezone.utc)
+        today = now.astimezone(timezone(timedelta(hours=9))).date()
+        snapshot = self.root / "out/state.sql"
+        with CrawlState(snapshot) as state:
+            with state.db:
+                state.db.execute("UPDATE jobs SET first_seen = ?, last_seen = ?",
+                                 ((now - timedelta(days=60)).isoformat(), (now - timedelta(days=8)).isoformat()))
+                state.db.execute("UPDATE jobs SET last_seen = ? WHERE link = ?",
+                                 ((now - timedelta(days=1)).isoformat(), rows[3]["link"]))
+        rows[0]["deadline"] = (today - timedelta(days=1)).isoformat()
+        rows[1]["deadline"] = today.isoformat()
+        source.write_text(json.dumps(rows[:2]))
+        result = self.run_daily()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[state-cleanup] expired=1 unseen_7_days=1 remaining=2", result.stderr)
+        self.assertEqual((self.root / "calls.txt").read_text(), "4\n1\n")
+        self.assertEqual(json.loads((self.root / "out/jobs_latest.json").read_text()), [rows[1]])
+        self.assertNotIn(rows[0]["title"], (self.root / "out/jobs_message_latest.html").read_text())
+        with CrawlState(snapshot) as state:
+            expected = [(rows[1]["link"],), (rows[3]["link"],)]
+            self.assertEqual(state.db.execute("SELECT link FROM jobs ORDER BY link").fetchall(), expected)
+            self.assertEqual(state.db.execute("SELECT link FROM filter_decisions ORDER BY link").fetchall(), expected)
+            self.assertEqual(state.db.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_cleanup_is_saved_even_if_agent_later_fails(self):
+        snapshot = self.root / "out/state.sql"
+        with CrawlState(snapshot) as state:
+            state.record([{"site": "wanted", "link": "https://example.com/stale", "deadline": "OPEN"}],
+                         now="2000-01-01T00:00:00+00:00")
+        self.fake_codex.write_text(f"#!{sys.executable}\nraise SystemExit(1)\n")
+        result = self.run_daily()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unseen_7_days=1 remaining=2", result.stderr)
+        with CrawlState(snapshot) as state:
+            self.assertEqual(state.db.execute("SELECT link FROM jobs ORDER BY link").fetchall(),
+                             [("https://example.com/1",), ("https://example.com/2",)])
+        self.assertFalse((self.root / "out/jobs_message_latest.html").exists())
+
     def test_sql_survives_agent_failure_and_allows_retry(self):
         original = self.fake_codex.read_text()
         self.fake_codex.write_text(f"#!{sys.executable}\nraise SystemExit(1)\n")
@@ -150,6 +199,11 @@ class OpenAI:
         self.assertFalse((self.root / "out/jobs_message_latest.txt").exists())
 
     def test_crawl_failure_stops_before_message_or_email_and_saves_report(self):
+        snapshot = self.root / "out/state.sql"
+        with CrawlState(snapshot) as state:
+            state.record([{"site": "wanted", "link": "https://example.com/stale", "deadline": "2000-01-01"}],
+                         now="2000-01-01T00:00:00+00:00")
+        original = snapshot.read_bytes()
         # Inject a transport failure into the isolated copy; never contact job sites or SMTP.
         crawler = self.root / "job_crawler.py"
         crawler.write_text(crawler.read_text() + '''
@@ -166,6 +220,8 @@ requests.Session.get = _offline
         reports = list((self.root / "out").glob("crawl_report_*.json"))
         self.assertEqual(len(reports), 1)
         self.assertEqual(json.loads(reports[0].read_text())[0]["status"], "failed")
+        self.assertEqual(snapshot.read_bytes(), original)
+        self.assertNotIn("[state-cleanup]", result.stderr)
 
 
 if __name__ == "__main__":

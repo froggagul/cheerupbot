@@ -6,12 +6,14 @@ import json
 import os
 import sqlite3
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from agent_filter import FilterResult
 
 SCHEMA_VERSION = 1
+KST = timezone(timedelta(hours=9))
+UNSEEN_RETENTION_DAYS = 7
 SCHEMA = """
 CREATE TABLE jobs (
     site TEXT NOT NULL,
@@ -60,6 +62,14 @@ def _identity(row: dict) -> tuple[str, str] | None:
     if not isinstance(site, str) or not isinstance(link, str) or not link.strip():
         return None
     return site, link
+
+
+def deadline_has_passed(row: dict, today: date) -> bool:
+    """Only a known, normalized deadline can expire a posting; today is still open."""
+    try:
+        return date.fromisoformat(row.get("deadline", "")) < today
+    except (TypeError, ValueError):
+        return False
 
 
 class CrawlState:
@@ -122,8 +132,42 @@ class CrawlState:
                         last_seen = excluded.last_seen
                 """, (*identity, _json(payload), fingerprint, now, now, now))
 
+    def cleanup(self, now: datetime | None = None) -> dict[str, int]:
+        """Remove expired jobs and jobs unseen for seven Seoul calendar days.
+
+        Call after recording this crawl so rediscovered jobs get a fresh last_seen.
+        Delete cached decisions first to support existing version-1 snapshots.
+        """
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        today = now.astimezone(KST).date()
+        cutoff = today - timedelta(days=UNSEEN_RETENTION_DAYS)
+        counts = {"expired": 0, "stale": 0}
+        removals = []
+        try:
+            for site, link, payload, last_seen in self.db.execute("SELECT site, link, payload, last_seen FROM jobs"):
+                if deadline_has_passed(json.loads(payload), today):
+                    reason = "expired"
+                else:
+                    seen_at = datetime.fromisoformat(last_seen.replace("Z", "+00:00"))
+                    if seen_at.tzinfo is None:
+                        seen_at = seen_at.replace(tzinfo=timezone.utc)
+                    if seen_at.astimezone(KST).date() > cutoff:
+                        continue
+                    reason = "stale"
+                counts[reason] += 1
+                removals.append((site, link))
+            with self.db:
+                self.db.executemany("DELETE FROM filter_decisions WHERE site = ? AND link = ?", removals)
+                self.db.executemany("DELETE FROM jobs WHERE site = ? AND link = ?", removals)
+            counts["remaining"] = self.db.execute("SELECT count(*) FROM jobs").fetchone()[0]
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            raise StateError(f"Cannot clean up crawl state: {exc}") from exc
+        return counts
+
     def filter(self, rows: list[dict], agent, provider: str, today: str | None = None) -> FilterResult:
-        today = today or datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+        today = today or datetime.now(KST).date().isoformat()
         policy = {
             "instructions": agent.instructions,
             "provider": provider,
