@@ -41,6 +41,30 @@ uv sync --frozen --python 3.10 --managed-python
 The dependency installer may ask for sudo. Each workflow installs the matching
 browser and verifies it can launch before restoring state or crawling.
 
+## Private recipients
+
+`recipients.txt` is local configuration ignored by Git. On the runner machine,
+create it from `recipients.example.txt`, replace the example addresses, and install
+it outside the checkout as the regular user running the runner service:
+
+```bash
+# First setup only.
+test -f recipients.txt || cp recipients.example.txt recipients.txt
+```
+
+Edit `recipients.txt` with the intended addresses, then copy it to the private location:
+
+```bash
+install -d -m 700 "$HOME/.config/cheerupbot"
+install -m 600 recipients.txt "$HOME/.config/cheerupbot/recipients.txt"
+```
+
+The workflow uses this private file for production recipients and dry-run summaries.
+Copy it again after changing recipients. An alternative absolute path can be set
+with `JOB_RECIPIENTS_FILE` in the workflow's `env` section. Keep the file outside
+the runner checkout, which is cleaned before each run. Test delivery uses the
+fixed test mailbox instead of this file.
+
 ## Operation
 
 ```bash
@@ -62,7 +86,7 @@ emails must go only to `froggaguldev@gmail.com`. Test mode replaces all configur
 recipients and adds `[TEST]` to the subject. The SMTP envelope contains only that
 address, including when a different sender is configured. To send a manual
 production digest, explicitly set `dry_run=false` and `test_delivery=false`.
-Scheduled production runs continue to use `recipients.txt`.
+Scheduled production runs use the [private recipient file](#private-recipients).
 
 Existing repository secrets continue supplying the OpenAI and SMTP credentials.
 Install the daily trigger after setting up the runner:

@@ -47,6 +47,8 @@ jobs:
         run: |
           state_dir="${RUNNER_TEMP}/cheerupbot-state-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           printf 'JOB_STATE_DIR=%s\nJOB_STATE_FILE=%s/state.sql\n' "$state_dir" "$state_dir" >> "$GITHUB_ENV"
+          # Private recipients live outside the checkout cleaned on every run.
+          printf 'JOB_RECIPIENTS_FILE=%s\n' "${JOB_RECIPIENTS_FILE:-${HOME}/.config/cheerupbot/recipients.txt}" >> "$GITHUB_ENV"
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.12.23'
@@ -115,7 +117,7 @@ jobs:
             --message-file out/jobs_message_latest.txt \
             --html-file out/jobs_message_latest.html \
             --subject '[알림] 오늘의 채용 요약' \
-            --recipients-file recipients.txt \
+            --recipients-file "$JOB_RECIPIENTS_FILE" \
             --send-mode single \
             "${test_args[@]}" \
             --no-dotenv

@@ -4,6 +4,65 @@ Collect job postings from Saramin, JobKorea, Wanted, Linkareer, Jasoseol, and Ca
 
 Korean strings in examples are intentional search terms, source labels, or message text. You can customize message text without changing the documentation language.
 
+### Environment setup
+
+For the default daily run (OpenAI filtering and email delivery), fill the four values in [`.env.example`](.env.example). Install dependencies and create your local file once:
+
+```bash
+uv sync --frozen
+test -f .env || cp .env.example .env
+chmod 600 .env
+```
+
+Edit `.env` with your own values. It is ignored by Git.
+
+| Variable | Where to get the value |
+| --- | --- |
+| `OPENAI_API_KEY` | Create a key in your OpenAI API account, as described below. |
+| `SMTP_HOST` | Your sending email provider's SMTP server; Gmail uses `smtp.gmail.com`. |
+| `SMTP_USER` | Your provider's SMTP login; for Gmail, your full sending email address. |
+| `SMTP_PASSWORD` | Your provider's SMTP credential; for Gmail, an app password. |
+
+**Get an OpenAI API key**
+
+1. Sign in to the [OpenAI API dashboard](https://platform.openai.com/api-keys) and create an API key for the project you will use.
+2. Copy the key into `OPENAI_API_KEY` in `.env`.
+3. Check your [API billing and credits](https://platform.openai.com/account/billing/overview) before running the daily filter. See the [official OpenAI quickstart](https://developers.openai.com/api/docs/quickstart) for key setup and billing guidance.
+
+**Get Gmail SMTP credentials**
+
+1. Sign in to the Google account that will send the emails and enable **2-Step Verification**.
+2. Open [Google App passwords](https://myaccount.google.com/apppasswords), create a password for this bot, and save it as `SMTP_PASSWORD`. App passwords require 2-Step Verification and may be unavailable for some account policies; see [Google's app-password guide](https://support.google.com/accounts/answer/185833?hl=en).
+3. Set `SMTP_HOST=smtp.gmail.com` and `SMTP_USER` to that account's full email address. This app already uses STARTTLS on port `587`, matching [Google's SMTP settings](https://knowledge.workspace.google.com/admin/gmail/send-email-from-a-printer-scanner-or-app).
+
+For another email provider, get its SMTP server, login, and SMTP/app password from its mail settings or administrator. The daily script and workflow use password authentication with STARTTLS; they do not implement OAuth login. A provider that requires SSL on port `465` needs `email_sender.py --use-ssl --smtp-port 465`; changing the port alone does not switch the daily automation to SSL.
+
+**Values you can leave out**
+
+- `SMTP_PORT` defaults to `587`; `SMTP_FROM` defaults to `SMTP_USER`. Add a sender override only when your provider requires an approved address different from the SMTP login.
+- The daily runner already defaults to OpenAI, `gpt-6-luna`, `medium` reasoning, `filters/new_grad_prompt.txt`, batches of `20`, a `120`-second timeout, and state at `out/state.sql`. Optional overrides are described under [agent filtering](#agent-filtering-openai-api--codex) and [daily automation](#daily-automation-with-cron).
+- SMTP credentials are unnecessary for `JOB_EMAIL_DRY_RUN=1` or HTML previews. OpenAI filtering still needs its API key during a dry run. Plain crawling and `JOB_AGENT_FILTER_PROVIDER=none` do not need an OpenAI key.
+
+GitHub Actions reads [repository secrets](#github-actions-and-repository-backed-sqlite-state), rather than your local `.env`. Exported environment variables take precedence over `.env`; select another local file with `JOB_ENV_FILE=.env.ec2` for the daily script or `--env-file .env.ec2` for the Python CLIs.
+
+### Adapt for another user
+
+1. **Set up your own copy.** Clone your own repository and follow [environment setup](#environment-setup) with your OpenAI account and sending mailbox.
+2. **Choose recipients and greetings.** Copy `recipients.example.txt` to `recipients.txt` and replace the example addresses with the intended recipients, one per line. Copy `nicknames.example.txt` to `nicknames.txt` and edit the names. Both local files are ignored by Git. Leaving the nickname file absent omits the greeting.
+3. **Change job preferences.** Edit `filters/new_grad_prompt.txt` for your role, experience, and location criteria. Add `JOB_KEYWORDS` to `.env` when changing search terms; `JOB_MESSAGE_TITLE` and `JOB_EMAIL_SUBJECT` customize the message labels. For Actions, put these optional overrides in the workflow's `env` section.
+4. **Set your fork's test mailbox.** In your own fork, change `TEST_EMAIL_RECIPIENT` in `email_sender.py` and the matching expectations in `tests/test_email_format.py` and `tests/test_daily_runner.py`. Update the test-address wording in `.github/workflows/daily-crawl.yml`, this README, and `docs/self-hosted-runner.md`. Test mode ignores `recipients.txt`; changing only that file does not redirect test emails.
+5. **Preview before scheduling.** Run `JOB_EMAIL_DRY_RUN=1 bash scripts/run_daily_email.sh`, then open `out/jobs_message_latest.html`. This may call the OpenAI API and updates local crawl state, but sends no email. After setting your fork's test mailbox, `JOB_EMAIL_TEST=1 bash scripts/run_daily_email.sh` sends only to that address.
+6. **Configure automation for your repository.** Add the four [Actions secrets](#github-actions-and-repository-backed-sqlite-state), then follow the [runner guide](docs/self-hosted-runner.md). Pass your repository to both installers, as shown below. The schedule remains 09:00 Asia/Seoul; choose one trigger, either the desktop timer or cron.
+
+On your own runner machine, after completing the runner prerequisites and preview:
+
+```bash
+RUNNER_REPOSITORY=YOUR_USER/YOUR_REPO bash scripts/setup_self_hosted_runner.sh
+RUNNER_REPOSITORY=YOUR_USER/YOUR_REPO bash scripts/setup_daily_schedule.sh
+```
+
+Actions checks out a separate working directory, so it does not see your development copies of the ignored files. Install the private recipient file using the [runner guide](docs/self-hosted-runner.md#private-recipients). For personalized greetings in Actions, keep the nickname file outside the runner checkout and set `JOB_NICKNAME_FILE` to its absolute path in the workflow's `env` section.
+
 ### Supported site IDs
 
 - `saramin`
@@ -189,7 +248,7 @@ Create output directories such as `out/` before running (`mkdir -p out`).
 The Codex provider requires a CLI that supports `--ignore-user-config`, `--ephemeral`, and `--output-schema`.
 Logins are specific to the machine and user; a desktop login does not authenticate an EC2 instance.
 
-To use the OpenAI API, copy `.env.example` to `.env`, set `OPENAI_API_KEY`, and select `--agent-filter openai`.
+To use the OpenAI API, follow [environment setup](#environment-setup), set `OPENAI_API_KEY`, and select `--agent-filter openai`.
 The API key is separate from a ChatGPT login. Select another configuration file with an option such as `--env-file .env.ec2`.
 Existing environment variables take precedence over the file; `--no-dotenv` disables file loading.
 
@@ -219,14 +278,18 @@ Use `JOB_ENV_FILE=.env.ec2` to select another file.
 An explicitly configured `JOB_FILTER_FILE` runs before the agent.
 Message generation does not call the agent again, and filter failures stop delivery.
 
-```dotenv
-JOB_AGENT_FILTER_PROVIDER=openai
-OPENAI_MODEL=gpt-6-luna
-OPENAI_REASONING_EFFORT=medium
-JOB_AGENT_PROMPT_FILE=filters/new_grad_prompt.txt
-JOB_AGENT_BATCH_SIZE=20
-JOB_AGENT_TIMEOUT=120
-```
+These optional variables override the built-in defaults; add them to `.env` only when changing behavior:
+
+| Variable | Default |
+| --- | --- |
+| `JOB_AGENT_FILTER_PROVIDER` | `openai` in the daily runner |
+| `OPENAI_MODEL` | `gpt-6-luna` |
+| `OPENAI_REASONING_EFFORT` | `medium` for the default model |
+| `JOB_AGENT_PROMPT_FILE` | `filters/new_grad_prompt.txt` |
+| `JOB_AGENT_BATCH_SIZE` | `20` |
+| `JOB_AGENT_TIMEOUT` | `120` seconds |
+
+For the optional Codex provider, `CODEX_BIN` overrides the `codex` executable and `CODEX_MODEL` overrides the CLI's model choice.
 
 Test the full local flow without sending email:
 
@@ -313,7 +376,11 @@ python email_sender.py \
 Open `out/email_preview.html` in a browser. `--preview-html` only saves a preview and exits; it does not require SMTP configuration or recipients.
 Pass `--html-file` when sending to use the card layout. If omitted, the text message is converted to HTML.
 
-Example recipient file (`recipients.txt`):
+Create your local recipient file from [`recipients.example.txt`](recipients.example.txt), then replace the example addresses:
+
+```bash
+cp recipients.example.txt recipients.txt
+```
 
 ```txt
 # One recipient per line.
@@ -321,12 +388,9 @@ me@example.com
 friend@example.com
 ```
 
-Environment setup:
+`recipients.txt` is ignored by Git. Use one address per line; blank lines and lines starting with `#` are ignored. Normal delivery needs at least one recipient, while `--test-email` uses the fixed test mailbox.
 
-```bash
-cp .env.example .env
-# Set SMTP_* values in .env.
-```
+Follow [environment setup](#environment-setup) to obtain the three SMTP values. Sending an already-generated message does not require `OPENAI_API_KEY`.
 
 Dry run:
 
@@ -374,7 +438,7 @@ Test delivery ignores `recipients.txt` and any other recipient arguments, sends
 only to the test address, and prefixes the subject with `[TEST]`. The email CLI
 also supports `--test-email`, and the daily shell script accepts `JOB_EMAIL_TEST=1`.
 For manual production delivery, explicitly set both `dry_run=false` and
-`test_delivery=false`. Scheduled production runs continue using `recipients.txt`.
+`test_delivery=false`. Scheduled production runs use the runner's private recipient file.
 
 No separate database server is required. During a run, Python's built-in SQLite operates in memory.
 Between runs, state is stored as a **`state.sql` text file** on the `crawl-state` branch.
@@ -389,21 +453,23 @@ Code and data live on separate branches; the data branch is created automaticall
 5. Export SQL and commit/push to `crawl-state` only when its contents change.
 6. Send the prepared email through SMTP only if all preceding steps succeed. Dry runs skip this step.
 
-The configured recipients are **`froggaguldev@gmail.com`** and **`ohansae@naver.com`**. Edit `recipients.txt` to change them.
+Local runs use your ignored `recipients.txt`. Actions uses `~/.config/cheerupbot/recipients.txt` under the runner user's home directory; follow the [private recipient setup](docs/self-hosted-runner.md#private-recipients). Set `JOB_RECIPIENTS_FILE` in the workflow's `env` section to use another absolute path. Updating the local file requires copying it to the runner's private location again.
 The email includes **all postings collected in the current run that survive filtering and the output limits**.
 Stored historical postings are not merged back into the email, and previously sent postings are not excluded merely because they were sent before.
 Rerunning the workflow may send the email again. Use a dry run to validate without delivery.
 
-Configure these repository secrets under **Settings → Secrets and variables → Actions**:
+Use the values from [environment setup](#environment-setup). In your GitHub repository, open **Settings → Secrets and variables → Actions → Secrets → New repository secret**. Add each name and its value, then select **Add secret**, following [GitHub's secrets guide](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets).
+
+Only these four secrets are needed for the default daily email:
 
 | Secret | Purpose |
 | --- | --- |
 | `OPENAI_API_KEY` | AI filter authentication; also required for dry runs |
 | `SMTP_HOST` | SMTP server |
-| `SMTP_PORT` | Defaults to `587`, using STARTTLS |
 | `SMTP_USER` | SMTP login account |
 | `SMTP_PASSWORD` | SMTP password or app password |
-| `SMTP_FROM` | Sender address; defaults to `SMTP_USER` if omitted |
+
+`SMTP_PORT` and `SMTP_FROM` are optional secrets: omit them to use `587` with STARTTLS and `SMTP_USER` as the sender. A dry run only requires `OPENAI_API_KEY`. The workflow sets `JOB_ENV_FILE=/dev/null` and does not load `.env` from the runner.
 
 Do not store a GitHub PAT as a workflow secret. State pushes use the per-run `GITHUB_TOKEN` with `contents: write` permission.
 If repository/organization policies or branch rules block direct writes to `crawl-state`, pushes fail; allow automation to write to that data branch.
@@ -513,8 +579,8 @@ Options:
 
 After installation:
 
-1. Set `SMTP_*` values in `.env`.
-2. Configure recipients in `recipients.txt`.
+1. Fill the four values in `.env` using [environment setup](#environment-setup).
+2. Copy `recipients.example.txt` to `recipients.txt` and replace the example addresses.
 3. Test with `JOB_EMAIL_DRY_RUN=1 bash scripts/run_daily_email.sh`.
 4. Check cron with `crontab -l`.
 
