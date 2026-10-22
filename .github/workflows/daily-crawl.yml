@@ -2,7 +2,8 @@ name: Daily crawl and email
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Approximately 09:00 Asia/Seoul; GitHub may delay scheduled jobs.
+    # Fallback only; disabled by JOB_SCHEDULE_ENABLED=false when the desktop timer is installed.
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       dry_run:

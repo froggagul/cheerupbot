@@ -1,8 +1,9 @@
 # Daily crawling on the desktop
 
 The daily crawl uses a Linux x64 GitHub Actions runner with the `cheerupbot`
-label. GitHub manages scheduling, secrets, logs, and artifacts; requests to job
-sites originate from the desktop's network. Tests still use GitHub-hosted runners.
+label. A desktop systemd timer requests the workflow at 09:00 Asia/Seoul each day.
+GitHub manages secrets, logs, and artifacts; requests to job sites originate from
+the desktop's network. Tests still use GitHub-hosted runners.
 No public/static IP or inbound port forwarding is needed.
 
 ## Install
@@ -64,13 +65,102 @@ production digest, explicitly set `dry_run=false` and `test_delivery=false`.
 Scheduled production runs continue to use `recipients.txt`.
 
 Existing repository secrets continue supplying the OpenAI and SMTP credentials.
-Scheduled runs remain at approximately 09:00 Asia/Seoul. Keep the computer awake
-and online; lingering does not wake a sleeping or powered-off computer. An offline
-runner leaves jobs queued, and GitHub fails jobs that remain queued for 24 hours.
-The installer does not change desktop power settings or install cron.
+Install the daily trigger after setting up the runner:
 
-`JOB_SCHEDULE_ENABLED=false` pauses scheduled crawling while allowing manual runs.
+```bash
+bash scripts/setup_daily_schedule.sh --dry-run
+bash scripts/setup_daily_schedule.sh
+systemctl --user list-timers cheerupbot-daily.timer --no-pager
+journalctl --user -u cheerupbot-daily.service -n 30 --no-pager
+```
+
+The timer requests `daily-crawl.yml` on `main` at **09:00 Asia/Seoul**, with
+one-second timer accuracy and no randomized delay. It passes `dry_run=false`
+and `test_delivery=false`, so the existing workflow sends the production digest
+after crawling, filtering, and saving state. Installation does not dispatch a
+workflow. The service uses the same user's `gh` login; keep that login valid.
+It does not automatically retry a failed dispatch, avoiding duplicate deliveries
+if GitHub accepted a request but its response was lost. Check the service journal
+if a morning run is missing, and check Actions before manually retrying.
+
+GitHub's native scheduled event can arrive hours late. The installer sets
+`JOB_SCHEDULE_ENABLED=false` to disable that fallback and prevent duplicate
+digests. Desktop-triggered runs appear as `workflow_dispatch` in Actions; they
+keep the same concurrency lock, secrets, state storage, and delivery checks.
+Workflow startup still depends on GitHub API availability and an available runner;
+09:00 is the dispatch time, and email follows when the run finishes.
+
+Keep the computer awake and online during the crawl; lingering starts services
+after boot and logout but does not wake the computer. `Persistent=true` catches
+up once after a missed dispatch while powered off. The daily schedule installer
+does not change power settings.
 Do not also schedule the local daily-email script: that would send duplicate mail.
+
+### Idle sleep with an 08:30–09:30 KST awake window
+
+Install the desktop user's cron policy, then the privileged hardware wake timer:
+
+```bash
+python3 scripts/desktop_power_policy.py --install
+sudo bash scripts/setup_daily_wake.sh
+```
+
+The cron job checks the time every minute and configures GNOME's built-in idle
+detection. Outside **08:30–09:30 Asia/Seoul**, automatic suspend occurs after
+**600 seconds without desktop activity**. During that window, automatic suspend
+is disabled. Settings are written only when they change, so minute-by-minute
+checks do not repeatedly reset idle detection. Desktop applications that inhibit
+automatic sleep, such as media playback, retain their normal behavior.
+
+Manual Suspend and Shutdown remain available at all times: the policy does not
+hold a sleep inhibitor or change the power button action. There is one scheduled
+wake at 08:30; manually suspending during the protected hour does not cause
+repeated wake-ups. At 09:30, normal idle-based suspend resumes; an active user
+is not forced to sleep. The policy applies to this user's logged-in GNOME session,
+including its lock screen. Log out is different from locking the screen.
+
+Cron itself cannot wake a suspended machine. `cheerupbot-wake.timer` runs in the
+system manager with `WakeSystem=true` and requires administrator authentication.
+It resumes the computer at **08:30 KST daily**, but cannot power on a shut-down
+computer. The cron policy leaves automatic sleep disabled until that timer is
+enabled and active. After installing the timer, the next cron tick enables the
+requested policy. The existing desktop runner and 09:00 dispatch remain local.
+Upgrading the wake timer removes the old 90-minute sleep inhibitor.
+
+The installer copies the policy into `~/.local/lib/cheerupbot/`, preserves unrelated
+cron entries, and saves the original four automatic-sleep settings under
+`~/.local/state/cheerupbot/desktop-power-original.json`. Reinstall after editing
+the source. Inspect settings, schedule, and policy changes with:
+
+```bash
+python3 scripts/desktop_power_policy.py --status
+crontab -l
+cat ~/.local/state/cheerupbot/desktop-power.log
+systemctl list-timers cheerupbot-wake.timer --no-pager
+systemctl --user status cheerupbot-runner.service cheerupbot-daily.timer
+```
+
+`bash scripts/setup_daily_wake.sh --dry-run` validates units without installing.
+Its optional `--sleep-now` flag explicitly requests one suspend in 60 seconds;
+omit that flag for normal idle-based sleep. Cancel a pending one-time sleep with
+`sudo systemctl stop cheerupbot-sleep-once.timer`. Advertised RTC capability and
+an armed timer do not replace a real suspend/resume check of firmware behavior.
+
+To restore the original idle settings and remove this power schedule:
+
+```bash
+python3 scripts/desktop_power_policy.py --remove
+sudo systemctl disable --now cheerupbot-wake.timer
+```
+
+References: [GNOME automatic suspend](https://help.gnome.org/gnome-help/power-autosuspend.html),
+[systemd wake timers](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html#WakeSystem=).
+
+### Pause and resume
+
+Pause/resume the desktop schedule with `systemctl --user disable --now
+cheerupbot-daily.timer` / `systemctl --user enable --now cheerupbot-daily.timer`.
+`JOB_SCHEDULE_ENABLED` controls only GitHub's fallback, not the desktop timer.
 
 Each run restores `crawl-state` into a unique directory beneath `RUNNER_TEMP`,
 including both the GitHub run ID and attempt number. Checkout cleans previous
@@ -85,7 +175,8 @@ systemctl --user stop cheerupbot-runner.service
 systemctl --user start cheerupbot-runner.service
 ```
 
-For removal, disable the service with `systemctl --user disable --now
+For removal, disable the timer with `systemctl --user disable --now
+cheerupbot-daily.timer`, then disable the runner with `systemctl --user disable --now
 cheerupbot-runner.service`, remove the runner in repository Settings → Actions →
 Runners, then delete its install directory and user service file. Disable lingering
 only if no other user services need to run after logout.

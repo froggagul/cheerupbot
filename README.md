@@ -244,7 +244,7 @@ API/CLI output references:
 
 ### Message text output
 
-Generate text suitable for pasting into KakaoTalk, Slack, or another messaging service.
+Generate text suitable for pasting into a messaging service.
 
 ```bash
 python main.py \
@@ -258,6 +258,14 @@ python main.py \
 Omit `--output` to print the message to the terminal.
 
 Random nickname greetings are also supported. By default, the CLI chooses a nickname from `nicknames.txt` and starts with `안녕 {nickname}야! 오늘의 채용 요약이야.` ("Hi {nickname}! Here's today's job summary.").
+
+Create your local nickname file from the example, then edit it with one nickname per line:
+
+```bash
+cp nicknames.example.txt nicknames.txt
+```
+
+`nicknames.txt` is ignored by Git. Blank lines and lines starting with `#` are ignored; if the file is missing or empty, the greeting is omitted.
 
 ```bash
 python main.py \
@@ -352,6 +360,8 @@ Options:
 
 The daily workflow runs on the desktop's self-hosted runner. See the
 [runner setup and operation guide](docs/self-hosted-runner.md).
+The guide also covers [10-minute idle sleep with an 08:30–09:30 KST awake window](docs/self-hosted-runner.md#idle-sleep-with-an-08300930-kst-awake-window),
+using a desktop cron policy and a hardware wake timer.
 
 **All test emails must go only to `froggaguldev@gmail.com`.** Manual runs default
 to `dry_run=true` (no delivery) and `test_delivery=true`. To test actual delivery:
@@ -399,8 +409,8 @@ Do not store a GitHub PAT as a workflow secret. State pushes use the per-run `GI
 If repository/organization policies or branch rules block direct writes to `crawl-state`, pushes fail; allow automation to write to that data branch.
 
 - **Manual validation:** Actions → Daily crawl and email → Run workflow. The default `dry_run=true` performs collection, filtering, and SQL persistence without sending email. HTML previews and reports are available in the artifact.
-- **Live delivery:** explicitly disable both `dry_run` and `test_delivery` to send a manual run to all configured recipients. Scheduled runs start at approximately 09:00 Korea time each day (`0 0 * * *` UTC). Email is sent after collection, filtering, and the SQL push finish. GitHub schedules can be delayed or skipped and do not guarantee an exact time. The workflow must exist on the default branch (`main`) for scheduled runs to operate.
-- **Disable scheduling:** set the repository variable `JOB_SCHEDULE_ENABLED=false`. Manual runs remain available.
+- **Live delivery:** explicitly disable both `dry_run` and `test_delivery` to send a manual run to all configured recipients. The desktop timer requests this production workflow daily at **09:00 Korea time**; install it with `bash scripts/setup_daily_schedule.sh`. Email is sent after collection, filtering, and the SQL push finish. GitHub API and runner availability still affect workflow startup. See the [runner operation guide](docs/self-hosted-runner.md).
+- **Scheduling:** the installer sets `JOB_SCHEDULE_ENABLED=false` to disable GitHub's native `0 0 * * *` UTC fallback, which can arrive hours late. Pause the desktop trigger with `systemctl --user disable --now cheerupbot-daily.timer`. The repository variable only controls the GitHub fallback; manual and desktop-triggered runs remain available.
 - **Model configuration:** set repository variables `OPENAI_MODEL` and `OPENAI_REASONING_EFFORT`. Defaults are `gpt-6-luna` and `medium`.
 - **Overlapping runs:** a fixed concurrency group serializes the entire restore → crawl → push sequence. Runs wait for earlier runs to finish instead of canceling an active run.
 
@@ -446,7 +456,7 @@ JOB_STATE_FILE=.crawl-state/state.sql JOB_EMAIL_DRY_RUN=1 bash scripts/run_daily
 
 Change the path with `JOB_STATE_FILE`, or disable persistent state with an empty value (`JOB_STATE_FILE=`).
 The restore directory must be empty. GitHub Actions uses a separate directory under the runner temporary path for each run ID and attempt number.
-Choose one scheduling environment: scheduling both server cron and GitHub Actions can result in duplicate emails.
+Choose one trigger: the desktop timer, server cron, or GitHub's native schedule. Enabling more than one can result in duplicate emails.
 
 Validation:
 
@@ -507,57 +517,6 @@ After installation:
 2. Configure recipients in `recipients.txt`.
 3. Test with `JOB_EMAIL_DRY_RUN=1 bash scripts/run_daily_email.sh`.
 4. Check cron with `crontab -l`.
-
-### KakaoTalk friend delivery (test app members)
-
-`kakao_sender.py` sends a text file such as `jobs_message.txt` through KakaoTalk.
-
-Requirements:
-
-- A Kakao app REST API key
-- A `refresh_token` (recommended) or `access_token`
-- Recipient UUIDs or nicknames
-
-Example token file (`kakao_tokens.json`):
-
-```json
-{
-  "refresh_token": "YOUR_REFRESH_TOKEN"
-}
-```
-
-List friends to look up nicknames and UUIDs:
-
-```bash
-python kakao_sender.py \
-  --rest-api-key "$KAKAO_REST_API_KEY" \
-  --token-file kakao_tokens.json \
-  --list-friends
-```
-
-Dry run to inspect the payload without sending:
-
-```bash
-python kakao_sender.py \
-  --rest-api-key "$KAKAO_REST_API_KEY" \
-  --token-file kakao_tokens.json \
-  --message-file jobs_message.txt \
-  --receiver-name "홍길동" \
-  --dry-run
-```
-
-Send a message:
-
-```bash
-python kakao_sender.py \
-  --rest-api-key "$KAKAO_REST_API_KEY" \
-  --token-file kakao_tokens.json \
-  --message-file jobs_message.txt \
-  --receiver-name "홍길동"
-```
-
-Long messages are automatically split according to `--max-text-length`.
-When using `.env`, set the `KAKAO_*` variables there and omit `--rest-api-key`.
 
 ### TODO
 

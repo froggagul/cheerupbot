@@ -17,3 +17,6 @@ out
 .crawl-state/
 *.sqlite3
 logs/
+
+# Local nickname configuration
+nicknames.txt

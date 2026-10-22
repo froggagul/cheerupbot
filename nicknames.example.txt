@@ -1,0 +1,5 @@
+# Copy this file to nicknames.txt and replace these example nicknames.
+# Use one nickname per line. Blank lines and lines starting with # are ignored.
+민수
+지우
+수아
